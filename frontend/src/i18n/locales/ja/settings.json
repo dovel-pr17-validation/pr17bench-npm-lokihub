@@ -1,0 +1,100 @@
+{
+  "title": "一般",
+  "description": "Lokihub の一般設定。",
+  "sections": {
+    "appearance": "外観",
+    "unitsAndCurrency": "単位と通貨",
+    "language": "言語"
+  },
+  "appearance": {
+    "theme": "テーマ",
+    "themeDescription": "ビジュアルテーマを選択してください",
+    "darkMode": "外観",
+    "darkModeDescription": "ライト・ダーク、またはシステム設定に従うかを選択",
+    "modes": {
+      "system": "システム",
+      "light": "ライト",
+      "dark": "ダーク"
+    },
+    "themes": {
+      "default": "デフォルト"
+    }
+  },
+  "units": {
+    "displayUnit": "表示単位",
+    "displayUnitDescription": "金額の表示方法を選択",
+    "fiatCurrency": "法定通貨",
+    "fiatCurrencyDescription": "優先する法定参照通貨",
+    "auto": "自動"
+  },
+  "language": {
+    "label": "言語",
+    "description": "お好みのインターフェース言語を選択してください",
+    "updated": "言語を更新しました。"
+  },
+  "toasts": {
+    "themeUpdated": "テーマを更新しました。",
+    "appearanceUpdated": "外観を更新しました。",
+    "currencyUpdated": "通貨を {{currency}} に設定しました",
+    "formatUpdated": "Flokicoin の表示形式を更新しました",
+    "currencyFetchFailed": "通貨の取得に失敗しました：{{error}}",
+    "updateFailed": "設定の更新に失敗しました"
+  },
+  "nav": {
+    "general": "一般",
+    "services": "サービス",
+    "autoUnlock": "自動ロック解除",
+    "unlockPassword": "ロック解除パスワード",
+    "backup": "バックアップ",
+    "migrate": "Lokihubを移行",
+    "developer": "開発者",
+    "debugTools": "デバッグツール",
+    "about": "概要"
+  },
+  "shutdown": {
+    "dialogTitle": "Lokihubをオフにしますか？",
+    "dialogDesc": "これによりLokihubがオフになり、ノードがオフラインになります。ロックを解除するまでflokicoinの送受信ができません。",
+    "cancel": "キャンセル",
+    "confirm": "続行",
+    "toast": "ノードがオフになりました。",
+    "failedToast": "ノードのシャットダウンに失敗しました"
+  },
+  "header": {
+    "title": "設定"
+  },
+  "changePassword": {
+    "title": "ロック解除パスワードを変更",
+    "important": "重要！",
+    "currentPassword": "現在のパスワード",
+    "newPassword": "新しいパスワード",
+    "confirmNew": "新しいパスワードを確認",
+    "save": "保存"
+  },
+  "backup": {
+    "title": "バックアップ",
+    "important": "重要",
+    "passwordLabel": "パスワード",
+    "active": "アクティブ"
+  },
+  "autoUnlock": {
+    "title": "自動ロック解除",
+    "attention": "注意",
+    "passwordLabel": "ロック解除パスワード"
+  },
+  "developer": {
+    "title": "開発者",
+    "tokenType": "トークンタイプ",
+    "tokenExpiry": "トークン有効期限（日数）",
+    "passwordLabel": "ロック解除パスワード",
+    "createToken": "トークンを作成"
+  },
+  "debugTools": {
+    "title": "デバッグツール",
+    "probeInvoice": "インボイスをプローブ",
+    "probeKeysend": "Keysendをプローブ",
+    "networkGraph": "ネットワークグラフを取得",
+    "refundTo": "返金先",
+    "onchainAddress": "オンチェーンアドレス",
+    "cancel": "キャンセル"
+  }
+}

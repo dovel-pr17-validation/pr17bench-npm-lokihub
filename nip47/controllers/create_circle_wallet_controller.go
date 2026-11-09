@@ -1,0 +1,487 @@
+package controllers
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/flokiorg/lokihub/apps"
+	"github.com/flokiorg/lokihub/constants"
+	"github.com/flokiorg/lokihub/db"
+	"github.com/flokiorg/lokihub/db/queries"
+	"github.com/flokiorg/lokihub/logger"
+	"github.com/flokiorg/lokihub/nip47/models"
+	"github.com/nbd-wtf/go-nostr"
+	"github.com/ohstr/nmilat/nipcw"
+	"gorm.io/gorm"
+)
+
+// circleRateLimitPerHour is the fallback used by tests, which build a
+// config.AppConfig literal directly rather than through envconfig.Process
+// (so its struct-tag default never applies). Runtime callers always go
+// through controller.cfg.GetEnv().CircleWalletRateLimitPerHour instead.
+const circleRateLimitPerHour = 3
+
+// errCircleQuotaExceeded is a sentinel returned from inside the commitment-check
+// transaction so the caller can distinguish "budget exceeded" from any other
+// transaction failure and respond with the right NIP-47 error code.
+var errCircleQuotaExceeded = errors.New("circle commitment would exceed available balance")
+
+// errCircleHubBudgetExceeded is a sentinel for the hub's own admin-set budget
+// ceiling (distinct from errCircleQuotaExceeded, which reflects the hub's
+// real balance) — see the MaxAmountLoki check below.
+var errCircleHubBudgetExceeded = errors.New("circle commitment would exceed the hub's configured budget")
+
+// errCircleMemberAlreadyHasWallet is a sentinel for the one-active-wallet-
+// per-(hub,identity) guard — see the CircleWalletMembership insert below.
+var errCircleMemberAlreadyHasWallet = errors.New("identity already has an active circle wallet under this hub")
+
+// create_circle_wallet's request is github.com/ohstr/nmilat/nipcw's own
+// exported CreateCircleWalletRequest (Pubkey/MaxAmount/Expiry/BudgetRenewal/
+// IdentityEvent) — same wire shape, field-for-field identical JSON tags to
+// this controller's former local createCircleWalletParams, adopted directly
+// instead of maintaining a parallel copy (nmilat migration). The
+// response stays this controller's own createCircleWalletResponse: nipcw's
+// own wire response type is unexported (it carries a still-NIP-44-encrypted
+// encrypted_details blob nipcw only exposes post-decryption to its own client
+// callers), so there's no exported type to adopt for it.
+
+// circleWalletDetails is everything a join hands back to the joining member.
+// It lives INSIDE the response's single NIP-44 encrypted field, keyed to the
+// joiner's own identity pubkey, and that placement is the security property:
+// create_circle_wallet is called over the *shared* circlehub connection, so the
+// NIP-47 response itself is encrypted only to a key every member holds. Any
+// field left outside is readable by every other member of the circle.
+//
+// That is why WalletPubkey in particular must be in here. It is the member's
+// wallet identity, and it appears in the clear `p` tag of every subsequent call
+// that wallet makes — so a co-member who could read it from the join response
+// would be able to follow that member's traffic for the wallet's whole life.
+// The terms travel alongside it because they describe this member's wallet
+// specifically, not the circle.
+//
+// It carries no secret and no connection string (NIP-CW §Response): the member
+// generated the connection key and builds its own connection string from
+// WalletPubkey, Relays and the secret it kept.
+type circleWalletDetails struct {
+	WalletPubkey string `json:"wallet_pubkey"`
+	// Relays is where the wallet listens, in failover order; never empty.
+	Relays []string `json:"relays"`
+	// MaxAmount is the cap the Hub actually set (NIP-CW): the request floored
+	// to whole loki, which is the unit the wallet's budget is stored in.
+	MaxAmount     uint64 `json:"max_amount"`
+	ExpiresAt     int64  `json:"expires_at"`
+	FeesPpm       int    `json:"fees_ppm"`
+	BudgetRenewal string `json:"budget_renewal"`
+}
+
+// createCircleWalletResponse carries exactly one field on purpose — see
+// circleWalletDetails. Anything added here is public to the whole circle.
+type createCircleWalletResponse struct {
+	EncryptedDetails string `json:"encrypted_details"`
+}
+
+func (controller *nip47Controller) HandleCreateCircleWalletEvent(ctx context.Context, nip47Request *models.Request, requestEventId uint, app *db.App, publishResponse publishFunc) {
+	params := &nipcw.CreateCircleWalletRequest{}
+	resp := decodeRequest(nip47Request, params)
+	if resp != nil {
+		publishResponse(resp, nostr.Tags{})
+		return
+	}
+
+	logger.Logger.Info().
+		Uint("app_id", app.ID).
+		Str("requester", params.Pubkey).
+		Msg("Handling create_circle_wallet request")
+
+	// 0. Requester pubkey must be a well-formed 64-char lowercase-hex Nostr
+	// pubkey before it's used anywhere below (allowlist/following lookups,
+	// rate limiting, and slicing into the wallet's display name) — an
+	// unvalidated string here previously risked an out-of-range panic.
+	if len(params.Pubkey) != 64 || params.Pubkey != strings.ToLower(params.Pubkey) {
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_BAD_REQUEST, "pubkey must be a 64-char lowercase-hex string")
+		return
+	}
+	if _, err := hex.DecodeString(params.Pubkey); err != nil {
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_BAD_REQUEST, "pubkey must be a 64-char lowercase-hex string")
+		return
+	}
+	// 0b. NIP-CW §Request: the member generates the wallet's connection keypair and
+	// sends only its public half. There is no Hub-generated alternative, so a
+	// request without one is refused rather than given a key the Hub made up.
+	if params.ConnectionPubkey == "" {
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_BAD_REQUEST, "connection_pubkey is required")
+		return
+	}
+	if len(params.ConnectionPubkey) != 64 || !nostr.IsValidPublicKey(params.ConnectionPubkey) {
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_BAD_REQUEST, "connection_pubkey must be a 64-char lowercase-hex x-only pubkey")
+		return
+	}
+	if params.ConnectionPubkey == params.Pubkey {
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_BAD_REQUEST, "connection_pubkey must differ from pubkey")
+		return
+	}
+
+	// 1. App must be circle_hub kind.
+	if app.Kind != db.AppKindCircleHub {
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_NOT_SUPPORTED, "create_circle_wallet requires a circle_hub app")
+		return
+	}
+
+	// Load provider config from its own table.
+	providerConfig, err := controller.appsService.GetCircleHubConfig(app.ID)
+	if err != nil {
+		logger.Logger.Error().Err(err).Uint("app_id", app.ID).Msg("Failed to load Circle Hub config")
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_INTERNAL, "failed to load Circle Hub config")
+		return
+	}
+	// NIP-CW §Response: the member reaches the wallet only through the relays
+	// sent back, so a Hub with none must not issue one.
+	relays := controller.cfg.GetRelayUrls()
+	if len(relays) == 0 {
+		logger.Logger.Error().Uint("app_id", app.ID).Msg("No relay configured; refusing to issue an unreachable circle wallet")
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_INTERNAL, "this hub has no relay to offer")
+		return
+	}
+
+	// 1b. Identity proof: the circle_hub connection is shared/public, so
+	// params.pubkey alone proves nothing — verify the caller actually
+	// controls it via a fresh, per-hub-bound, signed kind-23199 event before
+	// it's used for anything (allowlist/following lookups, rate limiting).
+	// This also closes the allowlist-membership oracle as a side effect: an
+	// attacker without the target's private key can never reach step 2 below.
+	if params.IdentityEvent == "" {
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_BAD_REQUEST, "identity_event is required")
+		return
+	}
+	var identityEvent nostr.Event
+	if err := json.Unmarshal([]byte(params.IdentityEvent), &identityEvent); err != nil {
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_BAD_REQUEST, "identity_event is not valid JSON")
+		return
+	}
+	// The d-tag binds this proof to "the Hub's own pubkey" (NIP-CW's own
+	// wording) — the value in the circle_hub connection's own pairing URI,
+	// i.e. app.WalletPubkey, not app.AppPubkey. AppPubkey is derived from
+	// the connection's secret and never appears anywhere a member holding
+	// only the shared connection string could learn it — checking against
+	// it here made this call unusable by any client that wasn't lokihub's
+	// own test suite (which cheats by deriving it locally). See the
+	// TestNmilatSDK_CircleWallet_CreateAndRedeemCashIntoIt regression test.
+	if app.WalletPubkey == nil {
+		logger.Logger.Error().Uint("app_id", app.ID).Msg("Circle Hub has no wallet pubkey set")
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_INTERNAL, "circle hub is not fully initialized")
+		return
+	}
+	if err := verifyCircleWalletIdentityEvent(&identityEvent, params.Pubkey, params.ConnectionPubkey, *app.WalletPubkey); err != nil {
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_BAD_REQUEST, err.Error())
+		return
+	}
+	// 1c. Single-use replay guard: a captured proof (anyone holding the
+	// shared connection can decrypt every request sent over it, including
+	// this one) must not be resubmittable within its own freshness window.
+	if err := controller.db.Create(&db.CircleWalletIdentityProof{AppID: app.ID, EventID: identityEvent.ID}).Error; err != nil {
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_BAD_REQUEST, "identity_event has already been used")
+		return
+	}
+
+	// 2. Authorization: requester must be in the circle's authorized set.
+	authorized, err := controller.socialCache.IsAuthorized(ctx, params.Pubkey, &providerConfig.CircleIdentity, controller.db)
+	if err != nil {
+		if errors.Is(err, constants.ErrSocialCacheWarmingUp) {
+			// Expected right after hub startup, not a bug — the requester just
+			// needs to retry once the initial cache warm-up finishes.
+			respondError(publishResponse, nip47Request.Method, nipcw.ErrNotReady, "hub is starting up, please retry shortly")
+			return
+		}
+		if errors.Is(err, constants.ErrCircleMembershipUnresolved) {
+			respondError(publishResponse, nip47Request.Method, nipcw.ErrNotReady, "the circle's membership list could not be fetched yet, please retry shortly")
+			return
+		}
+		// Any other failure also means membership can't be decided right now,
+		// which NIP-CW answers with NOT_READY, never with a refusal.
+		logger.Logger.Error().Err(err).Str("requester", params.Pubkey).Msg("Social cache authorization check failed")
+		respondError(publishResponse, nip47Request.Method, nipcw.ErrNotReady, "membership could not be checked yet, please retry shortly")
+		return
+	}
+	if !authorized {
+		respondError(publishResponse, nip47Request.Method, nipcw.ErrRestricted, "requester is not authorized by the circle policy")
+		return
+	}
+
+	// 2b. One active wallet per identity per hub: cheap pre-check for the
+	// common case (short-circuits before rate-limit/commitment work); the
+	// authoritative, race-proof guard is the unique-constraint insert inside
+	// the transaction below (step 7).
+	var existingMembershipCount int64
+	if err := controller.db.Model(&db.CircleWalletMembership{}).
+		Where("circle_hub_app_id = ? AND requester_pubkey = ?", app.ID, params.Pubkey).
+		Count(&existingMembershipCount).Error; err != nil {
+		logger.Logger.Error().Err(err).Uint("app_id", app.ID).Msg("Failed to check existing circle wallet membership")
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_INTERNAL, "membership check failed")
+		return
+	}
+	if existingMembershipCount > 0 {
+		respondError(publishResponse, nip47Request.Method, nipcw.ErrWalletExists, errCircleMemberAlreadyHasWallet.Error())
+		return
+	}
+
+	// 3. Expiration: cap the caller's requested duration, or default to the
+	// hub's own max when the caller omits it (an omitted/zero expiry used to
+	// produce an already-expired wallet — this closes that gap).
+	expirySecs := params.Expiry
+	if expirySecs <= 0 {
+		expirySecs = providerConfig.MaxExpSecs
+	} else if providerConfig.MaxExpSecs > 0 && expirySecs > providerConfig.MaxExpSecs {
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_BAD_REQUEST,
+			fmt.Sprintf("expiry %d exceeds max_exp_secs %d", params.Expiry, providerConfig.MaxExpSecs))
+		return
+	}
+
+	// 4. Compute the wallet's expiry from the resolved duration.
+	expiresAt := time.Now().Add(time.Duration(expirySecs) * time.Second)
+
+	// 4a. Reject a max_amount large enough to overflow int64 on the cast used
+	// against commitment/balance below — unconditional, independent of
+	// whether PerWalletMaxMloki happens to be configured, so this can't
+	// become a balance-check bypass via uint64->int64 wraparound if a future
+	// CircleHubConfig row is ever left with PerWalletMaxMloki <= 0 (today
+	// prevented at creation/update time, but not a DB-level invariant).
+	if params.MaxAmount > math.MaxInt64 {
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_BAD_REQUEST, "max_amount is too large")
+		return
+	}
+
+	// 4a2. Reject a max_amount that would floor to 0 whole loki on the /1000
+	// conversion below (any value in [0, 999] mloki). NIP-CW requires
+	// max_amount on every request — there is no "0 means unlimited" wire
+	// convention for this method, unlike other optional ceilings elsewhere
+	// in this codebase — so a value this small can only be an accidental
+	// sub-loki request, never a deliberate "no cap." Silently accepting it
+	// used to store MaxAmountLoki == 0, which validateCanPay treats as no
+	// cap at all: a full, silent bypass of the member's own quoted spend cap
+	// and the Hub's aggregate-exposure accounting.
+	if params.MaxAmount < 1000 {
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_BAD_REQUEST,
+			fmt.Sprintf("max_amount %d is below the minimum enforceable cap of 1000 mloki (1 loki)", params.MaxAmount))
+		return
+	}
+
+	// 4b. Budget-amount cap: the caller's requested max_amount must not
+	// exceed the hub's per-wallet ceiling (independent of the aggregate
+	// commitment-vs-balance check performed inside the transaction below).
+	if providerConfig.PerWalletMaxMloki > 0 && params.MaxAmount > uint64(providerConfig.PerWalletMaxMloki) {
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_QUOTA_EXCEEDED,
+			fmt.Sprintf("max_amount %d exceeds per_wallet_max_mloki %d", params.MaxAmount, providerConfig.PerWalletMaxMloki))
+		return
+	}
+
+	// 4c. Budget renewal: an omitted choice defaults to "never" (always
+	// compliant, regardless of the hub's floor). A requested renewal must not
+	// be tighter/more frequent than the hub's configured MinBudgetRenewal
+	// floor (e.g. a "monthly" floor allows "monthly"/"yearly"/"never" but
+	// rejects "daily"/"weekly").
+	resolvedBudgetRenewal := params.BudgetRenewal
+	if resolvedBudgetRenewal == "" {
+		resolvedBudgetRenewal = constants.BUDGET_RENEWAL_NEVER
+	} else if !slices.Contains(constants.GetBudgetRenewals(), resolvedBudgetRenewal) {
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_BAD_REQUEST,
+			fmt.Sprintf("budget_renewal must be one of %s, got %q", strings.Join(constants.GetBudgetRenewals(), ","), resolvedBudgetRenewal))
+		return
+	}
+	if constants.BudgetRenewalRank(resolvedBudgetRenewal) < constants.BudgetRenewalRank(providerConfig.MinBudgetRenewal) {
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_BAD_REQUEST,
+			fmt.Sprintf("budget_renewal %q is more frequent than this circle's min_budget_renewal %q", resolvedBudgetRenewal, providerConfig.MinBudgetRenewal))
+		return
+	}
+
+	// 5. Rate limit per requester pubkey.
+	if !controller.circleRateLimiter.Allow(params.Pubkey, controller.cfg.GetEnv().CircleWalletRateLimitPerHour) {
+		respondError(publishResponse, nip47Request.Method, nipcw.ErrRateLimited, "rate limit exceeded for create_circle_wallet")
+		return
+	}
+
+	// 6. Concurrent requests for the same Hub are serialised by the database,
+	// not in process: production builds a new controller per request, so a
+	// controller-local guard would never see a second request. The transaction
+	// below takes a Hub-scoped lock (a Postgres advisory lock; SQLite opens
+	// every write transaction with BEGIN IMMEDIATE), and the membership row's
+	// unique index is the authoritative one-wallet-per-identity guard.
+
+	circleScopes := []string{
+		constants.MAKE_INVOICE_SCOPE,
+		constants.PAY_INVOICE_SCOPE,
+		constants.GET_BALANCE_SCOPE,
+		constants.LOOKUP_INVOICE_SCOPE,
+		constants.LIST_TRANSACTIONS_SCOPE,
+		constants.GET_INFO_SCOPE,
+	}
+
+	// 7. Commitment check + wallet creation as one atomic unit. On Postgres, an
+	// advisory lock scoped to this transaction serialises concurrent requests
+	// for the same provider across processes — the lock is released automatically
+	// when the transaction commits or rolls back, so a failed/quota-exceeded
+	// attempt never leaves anything held.
+	var newApp *db.App
+	err = controller.db.Transaction(func(tx *gorm.DB) error {
+		if tx.Name() == "postgres" {
+			if err := tx.Exec("SELECT pg_advisory_xact_lock($1)", int64(app.ID)).Error; err != nil { //nolint:gosec // app IDs are small auto-increment DB primary keys
+				return fmt.Errorf("acquire circle commitment lock: %w", err)
+			}
+		}
+
+		commitment, err := queries.GetCircleCommitmentMloki(tx, app.ID)
+		if err != nil {
+			return fmt.Errorf("commitment check failed: %w", err)
+		}
+		balance := queries.GetIsolatedBalance(tx, app.ID)
+		if commitment+int64(params.MaxAmount) > balance { //nolint:gosec // params.MaxAmount > math.MaxInt64 already rejected above
+			return errCircleQuotaExceeded
+		}
+
+		// Hub-wide budget ceiling: an optional admin-set cap on the combined
+		// max_amount of every currently-live child, independent of the hub's
+		// real balance above. Stored on the hub's own circle_wallet-scope
+		// AppPermission (the hub is never granted pay_invoice, so this is not
+		// the standard payment-budget mechanism — see plan doc for context).
+		var hubPermission db.AppPermission
+		if err := tx.Where("app_id = ? AND scope = ?", app.ID, constants.CIRCLE_WALLET_SCOPE).
+			First(&hubPermission).Error; err != nil {
+			return fmt.Errorf("failed to load hub permission: %w", err)
+		}
+		if hubPermission.MaxAmountLoki > 0 && commitment+int64(params.MaxAmount) > int64(hubPermission.MaxAmountLoki)*1000 { //nolint:gosec // params.MaxAmount > math.MaxInt64 already rejected above; MaxAmountLoki is an app-internal budget value
+			return errCircleHubBudgetExceeded
+		}
+
+		// The member's own connection_pubkey is the wallet's client key, so no
+		// pairing secret is generated here, or anywhere (NIP-CW §Pairing
+		// Connection). A key already authorized for another connection on this
+		// node is refused, and rolls back everything this transaction did.
+		createdApp, _, err := controller.appsService.CreateAppTx(tx,
+			apps.GenerateChildName(app.Name, params.Pubkey),
+			params.ConnectionPubkey,
+			params.MaxAmount/1000,
+			resolvedBudgetRenewal,
+			&expiresAt,
+			circleScopes,
+			db.AppKindCircleWallet,
+			&app.ID,
+			db.ParentKindCircle,
+			map[string]interface{}{"requester_pubkey": params.Pubkey},
+		)
+		if err != nil {
+			return err
+		}
+
+		// NIP-CW §Fees: the member's rate is the one in force now, and stays.
+		if err := tx.Model(&db.App{}).Where("id = ?", createdApp.ID).
+			Update("circle_fees_ppm", providerConfig.FeesPpm).Error; err != nil {
+			return fmt.Errorf("failed to record the member's fee rate: %w", err)
+		}
+
+		// One active wallet per identity per hub, atomic guard: a unique-
+		// constraint violation here means a concurrent request for the same
+		// identity won the race since the pre-check above — roll back the
+		// whole transaction, including the App/permission rows just created.
+		if err := tx.Create(&db.CircleWalletMembership{
+			CircleHubAppID:  app.ID,
+			RequesterPubkey: params.Pubkey,
+			WalletAppID:     createdApp.ID,
+		}).Error; err != nil {
+			return errCircleMemberAlreadyHasWallet
+		}
+
+		newApp = createdApp
+		return nil
+	})
+
+	if errors.Is(err, errCircleQuotaExceeded) {
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_QUOTA_EXCEEDED, errCircleQuotaExceeded.Error())
+		return
+	}
+	if errors.Is(err, errCircleHubBudgetExceeded) {
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_QUOTA_EXCEEDED, errCircleHubBudgetExceeded.Error())
+		return
+	}
+	if errors.Is(err, errCircleMemberAlreadyHasWallet) {
+		respondError(publishResponse, nip47Request.Method, nipcw.ErrWalletExists, errCircleMemberAlreadyHasWallet.Error())
+		return
+	}
+	if errors.Is(err, apps.ErrDuplicateAppPubkey) {
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_BAD_REQUEST, "connection_pubkey cannot be used: generate a new connection key")
+		return
+	}
+	if err != nil {
+		publishResponse(&models.Response{
+			ResultType: nip47Request.Method,
+			Error:      mapNip47Error(err),
+		}, nostr.Tags{})
+		return
+	}
+
+	// The outer transaction above has now committed, so newApp is durably
+	// visible to other connections — only now is it safe to publish
+	// nwc_app_created (see CreateAppTx's doc comment). Publishing any earlier
+	// would race createAppConsumer's event-driven lookup against this
+	// transaction's own commit, silently skipping the new wallet's relay
+	// subscription setup with no retry — a wallet that would then never
+	// receive any NIP-47 request for its entire lifetime.
+	controller.appsService.NotifyAppCreated(newApp)
+
+	// The member builds its own connection string from wallet_pubkey, relays and
+	// the secret it kept; the Hub never had that secret, so there is nothing
+	// secret to send (NIP-CW §Response).
+	walletPubkey := *newApp.WalletPubkey
+
+	// Encrypt with the Hub's own key (app, not newApp): the requester's only
+	// prior trust anchor is the Hub connection they already dialed — the new
+	// child wallet's own pubkey is merely self-asserted inside this same
+	// response (circleWalletDetails.WalletPubkey), so using it as the
+	// encryption key would let the response vouch for itself. Encrypting under
+	// the already-established Hub key is what lets the requester trust this
+	// really came from the Hub they connected to.
+	hubWalletPrivKey, err := controller.keys.GetAppWalletKey(app.ID)
+	if err != nil {
+		logger.Logger.Error().Err(err).Uint("app_id", app.ID).Msg("Failed to get circle hub private key")
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_INTERNAL, "failed to derive wallet key")
+		return
+	}
+
+	detailsJSON, err := json.Marshal(circleWalletDetails{
+		WalletPubkey:  walletPubkey,
+		Relays:        relays,
+		MaxAmount:     params.MaxAmount / 1000 * 1000,
+		ExpiresAt:     expiresAt.Unix(),
+		FeesPpm:       providerConfig.FeesPpm,
+		BudgetRenewal: resolvedBudgetRenewal,
+	})
+	if err != nil {
+		logger.Logger.Error().Err(err).Msg("Failed to marshal circle wallet details")
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_INTERNAL, "failed to encode wallet details")
+		return
+	}
+
+	encryptedDetails, err := encryptForRecipient(params.Pubkey, hubWalletPrivKey, string(detailsJSON))
+	if err != nil {
+		logger.Logger.Error().Err(err).Msg("Failed to encrypt circle wallet details")
+		respondError(publishResponse, nip47Request.Method, constants.ERROR_INTERNAL, "failed to encrypt wallet details")
+		return
+	}
+
+	logger.Logger.Info().
+		Uint("circle_wallet_id", newApp.ID).
+		Uint("parent_app_id", app.ID).
+		Msg("Circle wallet created")
+
+	publishResponse(&models.Response{
+		ResultType: nip47Request.Method,
+		Result: createCircleWalletResponse{
+			EncryptedDetails: encryptedDetails,
+		},
+	}, nostr.Tags{})
+}

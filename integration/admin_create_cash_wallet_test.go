@@ -1,0 +1,174 @@
+//go:build integration
+
+// admin_create_cash_wallet_test.go covers the admin HTTP/Wails mint path
+// (api.CreateCashWallet, POST /api/apps/:id/cash-wallets) — a separate code
+// path from the NWC-facing mint_cash method every other fixture in this
+// suite mints through. It had solid mocked-LN unit coverage but zero
+// integration/live-node coverage: the
+// real internal-transfer funding step, the real mint_signature LND
+// SignMessage call, and NIP-CASH's "MUST be atomic" guarantee for this path
+// had never been proven against a live node.
+package integration
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/nbd-wtf/go-nostr"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/flokiorg/lokihub/constants"
+	"github.com/flokiorg/lokihub/lokicash"
+)
+
+// TestAdminCreateCashWallet_RedeemsIdenticallyToNWCMinted proves a wallet
+// minted via the admin HTTP path behaves identically to one minted via NWC
+// mint_cash: same connection shape (cash_token decodes to the same
+// pairing_uri, matching requireLokicashMatchesPairingURI's own invariant),
+// same balance, and — the part that actually proves real fund movement, not
+// just a plausible-looking response — a real cash_redeem against it succeeds
+// exactly like it would for an NWC-minted wallet.
+func TestAdminCreateCashWallet_RedeemsIdenticallyToNWCMinted(t *testing.T) {
+	cfg := requireConfig(t)
+	admin, ok := newAdminClient(cfg)
+	if !ok {
+		t.Skip("skipping: admin_api not configured - see integration/README.md")
+	}
+	_, hubAppID, _ := createEphemeralCashHub(t, cfg, "admin-mint-hub", nil)
+
+	beneficiaryPriv := newTestPrivkey(t)
+	beneficiaryPub, err := nostr.GetPublicKey(beneficiaryPriv)
+	require.NoError(t, err)
+
+	resp, err := admin.createCashWallet(hubAppID, adminCreateCashWalletRequest{
+		Recipients: []adminCashWalletRecipient{
+			{IdentityType: "pubkey", IdentityValue: beneficiaryPub, AmountMloki: happyPathAmountMloki},
+		},
+		ExpirySecs: happyPathExpirySecs,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, resp.PairingURI)
+	require.NotEmpty(t, resp.CashToken)
+	require.Len(t, resp.Recipients, 1)
+	require.EqualValues(t, happyPathAmountMloki, resp.Recipients[0].AmountMloki)
+	t.Cleanup(func() { _ = admin.deleteCashWallet(hubAppID, resp.AppID) })
+
+	requireLokicashMatchesPairingURI(t, resp.PairingURI, resp.CashToken)
+
+	decoded, err := lokicash.Decode(resp.CashToken)
+	require.NoError(t, err)
+
+	child := mustConnectBill(t, resp.PairingURI, resp.CashToken, beneficiaryPriv)
+
+	var balance CashStatusResult
+	require.NoError(t, child.Call(ctxT(t), constants.NIP47MethodCashStatus, CashStatusParams{Scope: "all"}, &balance))
+	require.EqualValues(t, happyPathAmountMloki, unclaimedMillis(balance),
+		"admin-minted wallet must be pre-funded with exactly the requested amount, same as an NWC-minted one")
+
+	// The real proof: an actual cash_redeem, moving real money, succeeds
+	// exactly as it would for an NWC-minted wallet (mirrors
+	// TestClaimFunds' own happy-path shape).
+	invoice := mintInvoiceFromSimpleWallet(t, cfg, happyPathAmountMloki, "integration admin-mint redeem")
+	proof := buildClaimProofEvent(t, beneficiaryPriv, decoded.WalletPubkey, invoice.PaymentHash, nil, time.Now())
+	var result ClaimFundsResult
+	require.NoError(t, child.Call(ctxT(t), constants.NIP47MethodCashRedeem, ClaimFundsParams{
+		Invoice:       invoice.Invoice,
+		IdentityType:  "pubkey",
+		IdentityValue: beneficiaryPub,
+		IdentityEvent: eventJSON(t, proof),
+	}, &result))
+	require.NotEmpty(t, result.Preimage, "cash_redeem against an admin-minted wallet must actually pay out")
+
+	// The bill held one slice and that slice has just been paid out, so it is
+	// deleted rather than left holding nothing -- there is no zero balance to
+	// read back any more.
+	requireSpentBillSilent(t, func(ctx context.Context) error {
+		var balanceAfter GetBalanceResult
+		return child.Call(ctx, "get_balance", struct{}{}, &balanceAfter)
+	})
+}
+
+// TestAdminCreateCashWallet_MintSignatureVerifiesAgainstLiveNode proves the
+// admin path's mint_signature field (previously this path
+// had no provenance field at all) produces a token that verifies against the
+// live node's real signing key — mirrors
+// TestCashMintProvenance/SignedTokenVerifiesToAStableNodeIdentity's own
+// pattern (cash_consolidate_test.go), but through the admin path.
+func TestAdminCreateCashWallet_MintSignatureVerifiesAgainstLiveNode(t *testing.T) {
+	cfg := requireConfig(t)
+	admin, ok := newAdminClient(cfg)
+	if !ok {
+		t.Skip("skipping: admin_api not configured - see integration/README.md")
+	}
+	_, hubAppID, _ := createEphemeralCashHub(t, cfg, "admin-mint-provenance-hub", nil)
+
+	beneficiaryPub, err := nostr.GetPublicKey(newTestPrivkey(t))
+	require.NoError(t, err)
+
+	resp, err := admin.createCashWallet(hubAppID, adminCreateCashWalletRequest{
+		Recipients: []adminCashWalletRecipient{
+			{IdentityType: "pubkey", IdentityValue: beneficiaryPub, AmountMloki: happyPathAmountMloki},
+		},
+		ExpirySecs:    happyPathExpirySecs,
+		MintSignature: true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = admin.deleteCashWallet(hubAppID, resp.AppID) })
+
+	decoded, err := lokicash.Decode(resp.CashToken)
+	require.NoError(t, err)
+	require.NotNil(t, decoded.MintSignature, "admin-minted token with mint_signature:true must carry a mint signature")
+	require.NotNil(t, decoded.AttestedAmount)
+	assert.EqualValues(t, happyPathAmountMloki, *decoded.AttestedAmount)
+
+	minter, verified := lokicash.VerifyMint(decoded)
+	require.True(t, verified, "admin-minted token's provenance signature must verify against the live node's real signing key")
+	assert.Len(t, minter, 66, "recovered minter must be a compressed secp256k1 pubkey (hex)")
+}
+
+// TestAdminCreateCashWallet_NoMintSignature_NoProvenance is the control:
+// omitting mint_signature (the default) produces a token with no
+// provenance, same as the NWC path's own default.
+// Renamed and INVERTED from TestAdminCreateCashWallet_NoMintSignature_NoProvenance, which
+// asserted an admin-minted bill carried no provenance when the caller did not ask for it.
+//
+// That premise is gone: a mint signature is now REQUIRED (NIP-CASH §Mint Provenance), there
+// is no opt-in any more, and a Hub that cannot obtain one MUST fail the mint rather than
+// issue an unsigned token. The reason is structural — the signature is the only thing a
+// token carries that identifies its minting Hub, and that identity is what a private-transport
+// announcement is verified against. An unsigned bill could not reach the only transport that
+// serves bill methods, so it would be unspendable.
+//
+// The admin path matters here specifically because it is a SECOND way to mint, and an
+// exemption on it would produce exactly those unspendable bills.
+func TestAdminCreateCashWallet_AlwaysCarriesProvenance(t *testing.T) {
+	cfg := requireConfig(t)
+	admin, ok := newAdminClient(cfg)
+	if !ok {
+		t.Skip("skipping: admin_api not configured - see integration/README.md")
+	}
+	_, hubAppID, _ := createEphemeralCashHub(t, cfg, "admin-mint-no-provenance-hub", nil)
+
+	beneficiaryPub, err := nostr.GetPublicKey(newTestPrivkey(t))
+	require.NoError(t, err)
+
+	resp, err := admin.createCashWallet(hubAppID, adminCreateCashWalletRequest{
+		Recipients: []adminCashWalletRecipient{
+			{IdentityType: "pubkey", IdentityValue: beneficiaryPub, AmountMloki: happyPathAmountMloki},
+		},
+		ExpirySecs: happyPathExpirySecs,
+		// Nothing requested: signing is not opt-in any more.
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = admin.deleteCashWallet(hubAppID, resp.AppID) })
+
+	decoded, err := lokicash.Decode(resp.CashToken)
+	require.NoError(t, err)
+	require.NotNil(t, decoded.MintSignature,
+		"an admin-minted bill must carry provenance; without it the bill cannot reach the private transport and is unspendable")
+	minter, verified := lokicash.VerifyMint(decoded)
+	require.True(t, verified, "the provenance must verify, not merely be present")
+	require.NotEmpty(t, minter, "a verified signature must recover its minting node")
+}

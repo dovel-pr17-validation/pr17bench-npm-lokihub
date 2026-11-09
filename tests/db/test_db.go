@@ -1,0 +1,102 @@
+package db
+
+import (
+	"fmt"
+	"net/url"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/peterldowns/pgtestdb"
+	"gorm.io/gorm"
+
+	"github.com/flokiorg/lokihub/db"
+	"github.com/flokiorg/lokihub/db/migrations"
+	"github.com/flokiorg/lokihub/logger"
+)
+
+const defaultTestDB = "test.db"
+
+func GetTestDatabaseURI() string {
+	ret := os.Getenv("TEST_DATABASE_URI")
+	if ret == "" {
+		// TODO: use in-memory DB, or a temporary file
+		return defaultTestDB
+	}
+
+	return ret
+}
+
+// NewDB opens a migrated test database.
+//
+// Takes testing.TB rather than *testing.T so benchmarks can use it too;
+// pgtestdb's own TB interface is satisfied by both.
+func NewDB(t testing.TB) (*gorm.DB, error) {
+	dbUri := GetTestDatabaseURI()
+
+	if dbUri == defaultTestDB {
+		//in case the file was not removed in the last run, remove it before starting the test
+		logger.Logger.Info().Str("uri", defaultTestDB).Msg("removing test db")
+		if err := os.Remove(defaultTestDB); err != nil && !os.IsNotExist(err) {
+			logger.Logger.Warn().Err(err).Str("uri", defaultTestDB).Msg("failed to remove test db")
+		}
+	}
+
+	logger.Logger.Info().Str("uri", dbUri).Msg("Creating new test DB with URI")
+	return NewDBWithURI(t, dbUri)
+}
+
+func NewDBWithURI(t testing.TB, uri string) (*gorm.DB, error) {
+	if db.IsPostgresURI(uri) {
+		parsedURI, err := url.Parse(uri)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse postgres DB URI: %w", err)
+		}
+
+		var user, password string
+		if userInfo := parsedURI.User; userInfo != nil {
+			user = userInfo.Username()
+			password, _ = userInfo.Password()
+		}
+
+		dbName := strings.TrimPrefix(parsedURI.Path, "/")
+
+		config := pgtestdb.Custom(t, pgtestdb.Config{
+			DriverName: "pgx",
+			Host:       parsedURI.Hostname(),
+			Port:       parsedURI.Port(),
+			User:       user,
+			Password:   password,
+			Database:   dbName,
+		}, pgtestdb.NoopMigrator{})
+
+		uri = config.URL()
+	}
+
+	gormDB, err := db.NewDBWithConfig(&db.Config{
+		URI:        uri,
+		LogQueries: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if err := migrations.Migrate(gormDB); err != nil {
+		return nil, fmt.Errorf("failed to migrate test DB: %w", err)
+	}
+
+	return gormDB, nil
+}
+
+func CloseDB(d *gorm.DB) {
+	if err := db.Stop(d); err != nil {
+		panic("failed to close database: " + err.Error())
+	}
+
+	if GetTestDatabaseURI() == defaultTestDB {
+		logger.Logger.Info().Str("uri", defaultTestDB).Msg("removing test db")
+		if err := os.Remove(defaultTestDB); err != nil && !os.IsNotExist(err) {
+			logger.Logger.Warn().Err(err).Str("uri", defaultTestDB).Msg("failed to remove test db")
+		}
+	}
+}

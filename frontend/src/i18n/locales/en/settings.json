@@ -1,0 +1,129 @@
+{
+  "title": "General",
+  "description": "General Lokihub settings.",
+  "sections": {
+    "appearance": "Appearance",
+    "unitsAndCurrency": "Units & Currency",
+    "language": "Language"
+  },
+  "appearance": {
+    "theme": "Theme",
+    "themeDescription": "Choose your visual theme",
+    "darkMode": "Appearance",
+    "darkModeDescription": "Choose light, dark, or follow your system setting",
+    "modes": {
+      "system": "System",
+      "light": "Light",
+      "dark": "Dark"
+    },
+    "themes": {
+      "default": "Default"
+    }
+  },
+  "units": {
+    "displayUnit": "Display Unit",
+    "displayUnitDescription": "Choose how amounts are displayed",
+    "fiatCurrency": "Fiat Currency",
+    "fiatCurrencyDescription": "Your preferred fiat reference currency",
+    "auto": "Auto"
+  },
+  "language": {
+    "label": "Language",
+    "description": "Choose your preferred interface language",
+    "updated": "Language updated."
+  },
+  "nav": {
+    "general": "General",
+    "services": "Services",
+    "autoUnlock": "Auto Unlock",
+    "unlockPassword": "Unlock Password",
+    "backup": "Backup",
+    "migrate": "Migrate Lokihub",
+    "developer": "Developer",
+    "debugTools": "Debug Tools",
+    "about": "About"
+  },
+  "shutdown": {
+    "dialogTitle": "Do you want to turn off your Lokihub?",
+    "dialogDesc": "This will turn off your Lokihub and make your node offline. You won't be able to send or receive flokicoin until you unlock it.",
+    "cancel": "Cancel",
+    "confirm": "Continue",
+    "toast": "Your node has been turned off.",
+    "failedToast": "Failed to shutdown node"
+  },
+  "header": {
+    "title": "Settings"
+  },
+  "changePassword": {
+    "title": "Unlock Password",
+    "description": "Change unlock password to your Hub. Your node will restart after password change.",
+    "important": "Important!",
+    "importantDesc": "Password can't be reset or recovered. Make sure to back it up!",
+    "currentPassword": "Current Password",
+    "newPassword": "New Password",
+    "confirmNew": "Confirm New Password",
+    "save": "Save",
+    "changeButton": "Change Password"
+  },
+  "backup": {
+    "title": "Backup",
+    "important": "Important",
+    "passwordLabel": "Password",
+    "active": "Active"
+  },
+  "autoUnlock": {
+    "title": "Auto Unlock",
+    "description": "Configure Lokihub will automatically unlock on start (e.g. after machine reboot)",
+    "bodyText": "In some situations it can be impractical to manually unlock the wallet every time Lokihub is started. In those cases you can save the unlock password in plaintext so that Lokihub can auto-unlock itself.",
+    "attention": "Attention",
+    "attentionDesc": "Everyone who has access to the machine running this hub could read that password and take your funds. Use this only in a secure environment.",
+    "passwordLabel": "Unlock Password",
+    "enableButton": "Enable Auto Unlock",
+    "disableButton": "Disable Auto Unlock"
+  },
+  "developer": {
+    "title": "Developer",
+    "description": "Power your apps with Lokihub.",
+    "nwcTitle": "Power your apps with NWC",
+    "nwcDesc": "Lokihub can power your lightning apps and services in all environments using Nostr Wallet Connect, an open protocol to connect lightning wallets and apps",
+    "learnMore": "Learn More on nwc.dev",
+    "apiTitle": "Experimental API access",
+    "apiDesc": "You can use your auth token to access the Lokihub internal API. However, whenever possible, we recommend using the NWC API directly for more stability. Please note that the internal API may change or be removed entirely in the future.",
+    "configureToken": "Configure Token",
+    "tokenType": "Token Type",
+    "tokenExpiry": "Token Expiry (Days)",
+    "passwordLabel": "Unlock Password",
+    "createToken": "Create Token",
+    "fullAccess": "Full Access",
+    "fullAccessDesc": "Complete control over your hub - can read data and perform all operations (send payments, manage apps, etc.)",
+    "readonlyAccess": "Read-Only Access",
+    "readonlyAccessDesc": "View-only access - can read balances, transactions, and other data but cannot perform operations"
+  },
+  "about": {
+    "title": "About",
+    "description": "Info about your Lokihub",
+    "version": "Lokihub Version",
+    "nodeBackend": "Lightning Node Backend",
+    "workDir": "Work Directory",
+    "nostrRelays": "Nostr Relays",
+    "online": "online",
+    "offline": "offline"
+  },
+  "debugTools": {
+    "title": "Debug Tools",
+    "probeInvoice": "Probe Invoice",
+    "probeKeysend": "Probe Keysend",
+    "networkGraph": "Get Network Graph",
+    "refundTo": "Refund to",
+    "onchainAddress": "On-chain address",
+    "cancel": "Cancel"
+  },
+  "toasts": {
+    "themeUpdated": "Theme updated.",
+    "appearanceUpdated": "Appearance updated.",
+    "currencyUpdated": "Currency set to {{currency}}",
+    "formatUpdated": "Flokicoin display format updated",
+    "currencyFetchFailed": "Failed to fetch currencies: {{error}}",
+    "updateFailed": "Failed to update settings"
+  }
+}

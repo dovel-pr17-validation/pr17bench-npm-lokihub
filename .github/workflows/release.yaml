@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get Latest Build-All Run ID
+        id: get_run_ids
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // linux.yaml/macos.yaml/windows.yaml are invoked as reusable
+            // workflows (workflow_call) from build-all.yaml, so their runs
+            // don't show up under their own workflow_id via listWorkflowRuns
+            // - the whole thing is one run, owned by build-all.yaml, with
+            // all three platforms' artifacts attached to that single run.
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'build-all.yaml',
+              status: 'success',
+              per_page: 1,
+            });
+
+            const runId = runs.data.workflow_runs.length > 0 ? runs.data.workflow_runs[0].id : null;
+            if (!runId) core.setFailed("No successful build-all.yaml runs found.");
+
+            console.log(`build-all.yaml Run ID: ${runId}`);
+            core.setOutput('run_id', runId);
+
+      - name: Read Version
+        id: version
+        shell: bash
+        run: |
+          if [ ! -f VERSION ]; then
+            echo "Error: VERSION file not found"
+            exit 1
+          fi
+          TAG=$(cat VERSION | tr -d '[:space:]')
+          if [ -z "$TAG" ]; then
+            echo "Error: VERSION file is empty"
+            exit 1
+          fi
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          if [[ "$TAG" == *-* ]]; then
+            echo "PRERELEASE=true" >> $GITHUB_ENV
+          else
+            echo "PRERELEASE=false" >> $GITHUB_ENV
+          fi
+
+      # A missing note used to set exists=false, which if:-gated off every
+      # remaining step -- so the job reported success having published
+      # nothing. That actually happened: releases/0.5.0-rc.4.md was committed
+      # and never released, and nobody noticed. Fail instead.
+      #
+      # A pre-release (0.5.0-rc.9) documents the version it is a candidate
+      # for, so the notes live under that open "## [0.5.0]" section rather
+      # than one heading per candidate -- mirrors how nmilat's CHANGELOG.md
+      # accumulates an unreleased version across its own rc's.
+      - name: Resolve Release Notes from CHANGELOG.md
+        id: notes
+        shell: bash
+        run: |
+          NOTES_VERSION="${TAG%%-*}"
+
+          NOTES=$(awk -v ver="$NOTES_VERSION" '
+            /^## \[/ {
+              if (found) exit
+              if (index($0, "[" ver "]") > 0) { found=1; next }
+            }
+            found { print }
+          ' CHANGELOG.md)
+          NOTES=$(printf '%s\n' "$NOTES" | sed -e '/./,$!d' -e ':a' -e '/^\n*$/{$d;N;ba' -e '}')
+
+          if [ -z "$NOTES" ]; then
+            echo "::error::no CHANGELOG.md section found for [$NOTES_VERSION] - write the release note and commit it before running this workflow"
+            exit 1
+          fi
+
+          {
+            echo "notes<<RELEASE_NOTES_EOF"
+            echo "$NOTES"
+            echo "RELEASE_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release note found for [$NOTES_VERSION] in CHANGELOG.md"
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ steps.get_run_ids.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: artifacts
+
+      - name: Display Artifacts
+        run: ls -R artifacts
+
+      # build-all.yaml is harvested by "latest successful run", which says
+      # nothing about which commit it built. Releasing 0.5.0-rc.8 once attached
+      # 18 files all named 0.5.0-rc.7, built ten days earlier: the notes
+      # described changes the binaries did not contain. Every asset carries the
+      # version in its filename, so the check is cheap.
+      - name: Verify artifacts match the version being released
+        shell: bash
+        run: |
+          set -euo pipefail
+          total=$(find artifacts -type f | wc -l)
+          if [ "$total" -eq 0 ]; then
+            echo "::error::no artifacts were downloaded from the build-all run"
+            exit 1
+          fi
+          wrong=$(find artifacts -type f ! -name "*${{ env.TAG }}*" | head -20 || true)
+          if [ -n "$wrong" ]; then
+            echo "::error::the latest successful build-all run produced artifacts that do not carry ${{ env.TAG }} in their names - it predates this version. Re-run build-all.yaml on this commit, then this workflow."
+            echo "$wrong"
+            exit 1
+          fi
+          echo "all $total artifacts carry ${{ env.TAG }}"
+
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Release ${{ env.TAG }}
+          body: ${{ steps.notes.outputs.notes }}
+          files: artifacts/**/*
+          fail_on_unmatched_files: true
+          prerelease: ${{ env.PRERELEASE }}

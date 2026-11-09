@@ -1,0 +1,401 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"time"
+
+	"archive/zip"
+	"os"
+	"path/filepath"
+
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+
+	"github.com/flokiorg/lokihub/constants"
+	"github.com/flokiorg/lokihub/db"
+	"github.com/flokiorg/lokihub/logger"
+	"github.com/flokiorg/lokihub/utils"
+	"golang.org/x/crypto/pbkdf2"
+)
+
+// backupMagic prefixes backups written by encryptingWriter starting with the
+// versioned format (backupFormatCTR). Legacy backups (pre-dating this
+// versioning) have no prefix at all - their first bytes are just the random
+// salt - so a 4-byte magic keeps the false-positive rate of misreading a
+// legacy salt as a version header astronomically low (unlike a 1-byte
+// marker, which a random salt byte would collide with 1/256 of the time).
+var backupMagic = []byte("LKHB")
+
+// backupFormatCTR marks a backup encrypted with AES-CTR (see encryptingWriter).
+// AES-OFB (used by the unversioned legacy format) is deprecated: it's an
+// unauthenticated stream cipher, allowing bit-flipping attacks against the
+// ciphertext. Since backups are a persisted, user-facing format, old backups
+// must remain restorable, so decryptingReader still supports reading OFB
+// when no magic/version prefix is present.
+const backupFormatCTR = 0x02
+
+// maxBackupEntrySize caps how much a single zip entry may decompress to when
+// restoring a backup, guarding against a decompression bomb filling the
+// disk. Generous enough to cover a Lightning node's db/channel state.
+const maxBackupEntrySize = 20 * 1024 * 1024 * 1024 // 20 GiB
+
+func (api *api) CreateBackup(unlockPassword string, w io.Writer) error {
+	logger.Logger.Info().Msg("Creating backup to migrate Lokihub to another device")
+	var err error
+
+	if !api.cfg.CheckUnlockPassword(unlockPassword) {
+		return errors.New("invalid unlock password")
+	}
+
+	autoUnlockPassword, err := api.cfg.Get("AutoUnlockPassword", "")
+	if err != nil {
+		return err
+	}
+	if autoUnlockPassword != "" {
+		return errors.New("please disable auto-unlock before using this feature")
+	}
+
+	if api.db.Name() != "sqlite" {
+		return errors.New("migration with non-sqlite backend is currently not supported")
+	}
+
+	workDir, err := filepath.Abs(api.cfg.GetEnv().Workdir)
+	if err != nil {
+		return fmt.Errorf("failed to get absolute workdir: %w", err)
+	}
+
+	lnStorageDir := ""
+
+	if api.svc.GetLNClient() == nil {
+		return fmt.Errorf("node not running")
+	}
+	lnStorageDir, err = api.svc.GetLNClient().GetStorageDir()
+	if err != nil {
+		return fmt.Errorf("failed to get storage dir: %w", err)
+	}
+	logger.Logger.Info().Interface("path", lnStorageDir).Msg("Found node storage dir")
+
+	// Reset the routing data to decrease the LDK DB size
+	err = api.svc.GetLNClient().ResetRouter("ALL")
+	if err != nil {
+		logger.Logger.Error().Err(err).Msg("Failed to reset router")
+		return fmt.Errorf("failed to reset router: %w", err)
+	}
+	// Stop the app to ensure no new requests are processed.
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), constants.APP_SHUTDOWN_TIMEOUT)
+	defer stopCancel()
+	api.svc.StopApp(stopCtx)
+
+	// Closing the database leaves the service in an inconsistent state,
+	// but that should not be a problem since the app is not expected
+	// to be used after its data is exported.
+	err = db.Stop(api.db)
+	if err != nil {
+		logger.Logger.Error().Err(err).Msg("Failed to stop database")
+		return fmt.Errorf("failed to close database: %w", err)
+	}
+
+	var filesToArchive []string
+
+	if lnStorageDir != "" {
+		lnFiles, err := filepath.Glob(filepath.Join(workDir, lnStorageDir, "*"))
+		if err != nil {
+			return fmt.Errorf("failed to list files in the LNClient storage directory: %w", err)
+		}
+		logger.Logger.Info().Interface("lnFiles", lnFiles).Msg("Listed node storage dir")
+
+		// Avoid backing up log files.
+		lnFiles = utils.Filter(lnFiles, func(s string) bool {
+			return filepath.Ext(s) != ".log"
+		})
+
+		filesToArchive = append(filesToArchive, lnFiles...)
+	}
+
+	cw, err := encryptingWriter(w, unlockPassword)
+	if err != nil {
+		return fmt.Errorf("failed to create encrypted writer: %w", err)
+	}
+
+	zw := zip.NewWriter(cw)
+	defer func() {
+		// A failed Close means the zip's central directory never got
+		// flushed, so the backup archive is likely truncated/corrupt.
+		if err := zw.Close(); err != nil {
+			logger.Logger.Error().Err(err).Msg("Failed to finalize backup zip archive")
+		}
+	}()
+
+	addFileToZip := func(fsPath, zipPath string) error {
+		inF, err := os.Open(fsPath) //nolint:gosec // fsPath comes from this node's own configured DatabaseUri/workdir, not external input
+		if err != nil {
+			return fmt.Errorf("failed to open source file for reading: %w", err)
+		}
+		defer func() { _ = inF.Close() }()
+
+		outW, err := zw.Create(zipPath)
+		if err != nil {
+			return fmt.Errorf("failed to create zip entry: %w", err)
+		}
+
+		_, err = io.Copy(outW, inF)
+		return err
+	}
+
+	// Locate the main database file.
+	dbFilePath := api.cfg.GetEnv().DatabaseUri
+	// Add the database file to the archive.
+	logger.Logger.Info().Interface("nwc.db", dbFilePath).Msg("adding nwc db to zip")
+	err = addFileToZip(dbFilePath, "nwc.db")
+	if err != nil {
+		logger.Logger.Error().Err(err).Msg("Failed to zip nwc db")
+		return fmt.Errorf("failed to write nwc db file to zip: %w", err)
+	}
+
+	for _, fileToArchive := range filesToArchive {
+		logger.Logger.Info().Interface("fileToArchive", fileToArchive).Msg("adding file to zip")
+		relPath, err := filepath.Rel(workDir, fileToArchive)
+		if err != nil {
+			logger.Logger.Error().Err(err).Msg("Failed to get relative path of input file")
+			return fmt.Errorf("failed to get relative path of input file: %w", err)
+		}
+
+		// Ensure forward slashes for zip format compatibility.
+		err = addFileToZip(fileToArchive, filepath.ToSlash(relPath))
+		if err != nil {
+			logger.Logger.Error().Err(err).Msg("Failed to write file to zip")
+			return fmt.Errorf("failed to write input file to zip: %w", err)
+		}
+	}
+
+	logger.Logger.Info().Msg("Successfully created backup to migrate Lokihub to another device")
+
+	return nil
+}
+
+func (api *api) RestoreBackup(unlockPassword string, r io.Reader) error {
+	logger.Logger.Info().Msg("Restoring migration backup file")
+
+	workDir, err := filepath.Abs(api.cfg.GetEnv().Workdir)
+	if err != nil {
+		return fmt.Errorf("failed to get absolute workdir: %w", err)
+	}
+
+	if strings.HasPrefix(api.cfg.GetEnv().DatabaseUri, "file:") {
+		return errors.New("cannot restore backup when database path is a file URI")
+	}
+
+	if api.db.Name() != "sqlite" {
+		return errors.New("migration to non-sqlite backend is currently not supported")
+	}
+
+	cr, err := decryptingReader(r, unlockPassword)
+	if err != nil {
+		return fmt.Errorf("failed to create decrypted reader: %w", err)
+	}
+
+	tmpF, err := os.CreateTemp(api.cfg.GetEnv().Workdir, "lokihub-*.bkp")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary output file: %w", err)
+	}
+	tmpName := tmpF.Name()
+	defer func() {
+		if err := os.Remove(tmpName); err != nil {
+			logger.Logger.Warn().Err(err).Str("path", tmpName).Msg("Failed to remove temporary restore file")
+		}
+	}()
+	defer func() { _ = tmpF.Close() }()
+
+	zipSize, err := io.Copy(tmpF, cr)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt backup data into temporary file: %w", err)
+	}
+
+	if err = tmpF.Sync(); err != nil {
+		return fmt.Errorf("failed to flush temporary file: %w", err)
+	}
+
+	if _, err = tmpF.Seek(0, 0); err != nil {
+		return fmt.Errorf("failed to seek to beginning of temporary file: %w", err)
+	}
+
+	zr, err := zip.NewReader(tmpF, zipSize)
+	if err != nil {
+		return fmt.Errorf("failed to create zip reader: %w", err)
+	}
+
+	restoreDir := filepath.Join(workDir, "restore")
+
+	extractZipEntry := func(zipFile *zip.File) error {
+		fsFilePath := filepath.Join(restoreDir, filepath.FromSlash(zipFile.Name))
+
+		// zip-slip guard: a crafted entry name like "../../etc/passwd" would
+		// otherwise let a malicious backup file write outside restoreDir.
+		if fsFilePath != restoreDir && !strings.HasPrefix(fsFilePath, restoreDir+string(os.PathSeparator)) {
+			return fmt.Errorf("zip entry %q escapes restore directory", zipFile.Name)
+		}
+
+		if err = os.MkdirAll(filepath.Dir(fsFilePath), 0700); err != nil {
+			return fmt.Errorf("failed to create directory for zip entry: %w", err)
+		}
+
+		inF, err := zipFile.Open()
+		if err != nil {
+			return fmt.Errorf("failed to open zip entry for reading: %w", err)
+		}
+		defer func() { _ = inF.Close() }()
+
+		outF, err := os.OpenFile(fsFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600) //nolint:gosec // fsFilePath is checked above to stay within restoreDir
+		if err != nil {
+			return fmt.Errorf("failed to create destination file: %w", err)
+		}
+		defer func() {
+			// A failed Close here means a restored file may be truncated
+			// on disk without RestoreBackup's caller ever finding out.
+			if err := outF.Close(); err != nil {
+				logger.Logger.Error().Err(err).Str("path", fsFilePath).Msg("Failed to close restored file")
+			}
+		}()
+
+		// Cap decompressed output regardless of what the zip's central
+		// directory claims, guarding against a decompression bomb filling
+		// the disk.
+		written, err := io.CopyN(outF, inF, maxBackupEntrySize+1)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("failed to write zip entry to destination file: %w", err)
+		}
+		if written > maxBackupEntrySize {
+			return fmt.Errorf("zip entry %q exceeds maximum allowed size", zipFile.Name)
+		}
+
+		return nil
+	}
+
+	logger.Logger.Info().Int("count", len(zr.File)).Msg("Extracting files")
+	for _, f := range zr.File {
+		logger.Logger.Info().Interface("file", f.Name).Msg("Extracting file")
+		if err = extractZipEntry(f); err != nil {
+			return fmt.Errorf("failed to extract zip entry: %w", err)
+		}
+	}
+	logger.Logger.Info().Int("count", len(zr.File)).Msg("Extracted files")
+
+	go func() {
+		logger.Logger.Info().Msg("Backup restored. Shutting down Lokihub...")
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), constants.APP_SHUTDOWN_TIMEOUT)
+		defer shutdownCancel()
+		api.svc.Shutdown(shutdownCtx)
+		// ensure no -shm or -wal files exist as they will stop the restore
+		for _, filename := range []string{"nwc.db", "nwc.db-shm", "nwc.db-wal"} {
+			err = os.Remove(filepath.Join(workDir, filename))
+			if err != nil {
+				logger.Logger.Error().Err(err).Str("filename", filename).Msg("failed to remove old nwc db file before restore")
+			}
+		}
+
+		// schedule node shutdown after a few seconds to ensure frontend updates
+		time.Sleep(5 * time.Second)
+		os.Exit(0)
+	}()
+
+	return nil
+}
+
+func encryptingWriter(w io.Writer, password string) (io.Writer, error) {
+	salt := make([]byte, 8)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, fmt.Errorf("failed to generate salt: %w", err)
+	}
+
+	encKey := pbkdf2.Key([]byte(password), salt, 4096, 32, sha256.New)
+	block, err := aes.NewCipher(encKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create AES cipher: %w", err)
+	}
+
+	iv := make([]byte, aes.BlockSize)
+	if _, err = rand.Read(iv); err != nil {
+		return nil, fmt.Errorf("failed to generate IV: %w", err)
+	}
+
+	if _, err = w.Write(backupMagic); err != nil {
+		return nil, fmt.Errorf("failed to write format magic: %w", err)
+	}
+
+	if _, err = w.Write([]byte{backupFormatCTR}); err != nil {
+		return nil, fmt.Errorf("failed to write format version: %w", err)
+	}
+
+	_, err = w.Write(salt)
+	if err != nil {
+		return nil, fmt.Errorf("failed to write salt: %w", err)
+	}
+
+	_, err = w.Write(iv)
+	if err != nil {
+		return nil, fmt.Errorf("failed to write IV: %w", err)
+	}
+
+	stream := cipher.NewCTR(block, iv)
+	cw := &cipher.StreamWriter{
+		S: stream,
+		W: w,
+	}
+
+	return cw, nil
+}
+
+func decryptingReader(r io.Reader, password string) (io.Reader, error) {
+	header := make([]byte, len(backupMagic)+1)
+	n, err := io.ReadFull(r, header)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return nil, fmt.Errorf("failed to read backup header: %w", err)
+	}
+
+	var streamCipher func(block cipher.Block, iv []byte) cipher.Stream
+	if n == len(header) && bytes.Equal(header[:len(backupMagic)], backupMagic) {
+		switch header[len(backupMagic)] {
+		case backupFormatCTR:
+			streamCipher = cipher.NewCTR
+		default:
+			return nil, fmt.Errorf("unsupported backup format version: %d", header[len(backupMagic)])
+		}
+	} else {
+		// No recognized magic/version prefix: assume a legacy (pre-versioning)
+		// OFB-encrypted backup, whose first bytes are the random salt itself.
+		// Splice the bytes already consumed from r back onto the front.
+		r = io.MultiReader(bytes.NewReader(header[:n]), r)
+		streamCipher = cipher.NewOFB //nolint:staticcheck // required to decrypt pre-versioning backups; new backups use backupFormatCTR
+	}
+
+	salt := make([]byte, 8)
+	if _, err := io.ReadFull(r, salt); err != nil {
+		return nil, fmt.Errorf("failed to read salt: %w", err)
+	}
+
+	iv := make([]byte, aes.BlockSize)
+	if _, err := io.ReadFull(r, iv); err != nil {
+		return nil, fmt.Errorf("failed to read IV: %w", err)
+	}
+
+	encKey := pbkdf2.Key([]byte(password), salt, 4096, 32, sha256.New)
+	block, err := aes.NewCipher(encKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create AES cipher: %w", err)
+	}
+
+	stream := streamCipher(block, iv)
+	cr := &cipher.StreamReader{
+		S: stream,
+		R: r,
+	}
+
+	return cr, nil
+}

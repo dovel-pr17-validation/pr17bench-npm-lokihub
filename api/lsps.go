@@ -1,0 +1,674 @@
+package api
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/flokiorg/lokihub/logger"
+	"github.com/flokiorg/lokihub/lsps/lsps1"
+	"github.com/flokiorg/lokihub/lsps/manager"
+	"github.com/flokiorg/lokihub/lsps/persist"
+	"github.com/flokiorg/lokihub/utils"
+	"gorm.io/gorm"
+)
+
+// lspsRequestTimeout is the timeout for LSPS protocol requests
+const lspsRequestTimeout = 15 * time.Second
+
+// LSPS0ListProtocols lists supported protocols
+func (api *api) LSPS0ListProtocols(ctx context.Context, req *LSPS0ListProtocolsRequest) (*LSPS0ListProtocolsResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, lspsRequestTimeout)
+	defer cancel()
+
+	client := api.svc.GetLiquidityManager().LSPS0Client()
+	if client == nil {
+		return nil, fmt.Errorf("LSPS0 client not available")
+	}
+
+	protocols, err := client.ListProtocols(ctx, req.LSPPubkey)
+	if err != nil {
+		logger.Logger.Error().Err(err).Str("lsp", req.LSPPubkey).Msg("LSPS0 ListProtocols failed")
+		return nil, err
+	}
+
+	return &LSPS0ListProtocolsResponse{
+		Protocols: protocols,
+	}, nil
+}
+
+// LSPS1GetInfo gets channel ordering info
+func (api *api) LSPS1GetInfo(ctx context.Context, req *LSPS1GetInfoRequest) (interface{}, error) {
+	ctx, cancel := context.WithTimeout(ctx, lspsRequestTimeout)
+	defer cancel()
+
+	// Use synchronous manager method
+	// Note: manager returns []lsps1.LSPS1Option or similar?
+	// The manager method signature I added in manager.go checks `GetLSPS1InfoList` returns `[]lsps1.LSPS1Option`?
+	// Wait, in manager.go I used `lsps1.LSPS1Option` which was UNDEFINED.
+	// I need to fix manager.go imports or type names FIRST.
+	// In msgs.go it is called `Options`.
+	// So let's assume I fix manager.go to use `lsps1.Options`.
+
+	// Assuming manager is fixed:
+	options, err := api.svc.GetLiquidityManager().GetLSPS1InfoList(ctx, req.LSPPubkey)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			logger.Logger.Warn().Str("lsp", req.LSPPubkey).Msg("LSPS1 GetInfo timeout")
+			return nil, fmt.Errorf("time out, please retry")
+		}
+		logger.Logger.Error().Err(err).Str("lsp", req.LSPPubkey).Msg("LSPS1 GetInfo failed")
+		return nil, err
+	}
+
+	// Return the first option directly for simpler consumption, matching LSPS2 style
+	if len(options) == 0 {
+		return nil, fmt.Errorf("no options provided by LSP")
+	}
+
+	return options[0], nil
+}
+
+// LSPS1CreateOrder creates a channel order
+func (api *api) LSPS1CreateOrder(ctx context.Context, req *LSPS1CreateOrderRequest) (interface{}, error) {
+	ctx, cancel := context.WithTimeout(ctx, lspsRequestTimeout)
+	defer cancel()
+	orderParams := lsps1.OrderParams{
+		LspBalanceLoki:               req.LSPBalanceLoki,    // Amount of inbound liquidity requested (from amount_loki)
+		ClientBalanceLoki:            req.ClientBalanceLoki, // Use requested client balance
+		RequiredChannelConfirmations: 0,                     // Accept unconfirmed (LSP can override based on their policy)
+		FundingConfirmsWithinBlocks:  6,                     // Standard Bitcoin confirmation window
+		ChannelExpiryBlocks:          req.ChannelExpiryBlocks,
+		Token:                        req.Token,
+		AnnounceChannel:              req.AnnounceChannel,
+		OpeningFeeParams:             req.OpeningFeeParams,
+	}
+
+	logger.Logger.Info().Interface("order_params", orderParams).Msg("Creating LSPS1 order")
+
+	event, err := api.svc.GetLiquidityManager().CreateLSPS1Order(ctx, req.LSPPubkey, orderParams, req.RefundOnchainAddress)
+	if err != nil {
+		logger.Logger.Error().Err(err).Str("lsp", req.LSPPubkey).Interface("params", orderParams).Msg("LSPS1 CreateOrder failed")
+		return nil, err
+	}
+
+	invoice := ""
+	var feeTotalLoki uint64
+	var orderTotalLoki uint64
+	if event.Payment.Bolt11 != nil {
+		invoice = event.Payment.Bolt11.Invoice
+		feeTotalLoki = event.Payment.Bolt11.FeeTotalLoki
+		orderTotalLoki = event.Payment.Bolt11.OrderTotalLoki
+		// Fallback: if fee is not provided but total is, and we know client balance is 0,
+		// then fee must be the total payload (for LSPS1 buy-inbound).
+		if feeTotalLoki == 0 && orderTotalLoki > 0 {
+			feeTotalLoki = orderTotalLoki
+		}
+	}
+
+	// Register webhook for notifications (on-demand, async so as not to block response)
+	go func() { //nolint:gosec // intentionally decoupled from the request context; see comment below
+		// A fresh context is required here: this goroutine deliberately
+		// outlives the request (fire-and-forget), so the request-scoped ctx
+		// would already be cancelled by the time this runs.
+		bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := api.svc.GetLiquidityManager().EnsureWebhookRegistered(bgCtx, req.LSPPubkey); err != nil {
+			logger.Logger.Warn().Err(err).Str("lsp", req.LSPPubkey).Msg("Failed to register webhook")
+		}
+	}()
+
+	return map[string]interface{}{
+		"order_id":            event.OrderID,
+		"payment_invoice":     invoice,
+		"fee_total_loki":      feeTotalLoki,
+		"order_total_loki":    orderTotalLoki,
+		"lsp_balance_loki":    orderParams.LspBalanceLoki,
+		"client_balance_loki": orderParams.ClientBalanceLoki,
+	}, nil
+}
+
+// LSPS1GetOrder checks order status
+func (api *api) LSPS1GetOrder(ctx context.Context, req *LSPS1GetOrderRequest) (interface{}, error) {
+	ctx, cancel := context.WithTimeout(ctx, lspsRequestTimeout)
+	defer cancel()
+
+	event, err := api.svc.GetLiquidityManager().GetLSPS1Order(ctx, req.LSPPubkey, req.OrderID)
+	if err != nil {
+		logger.Logger.Error().Err(err).Str("lsp", req.LSPPubkey).Str("order_id", req.OrderID).Msg("LSPS1 GetOrder failed")
+		return nil, err
+	}
+
+	invoice := ""
+	if event.Payment.Bolt11 != nil {
+		invoice = event.Payment.Bolt11.Invoice
+	}
+	// Extract state from Payment info (Bolt11) or OrderState?
+	// msgs.go has OrderState string.
+	// OrderChannel.tsx expects `state`.
+	// Use OrderState from the event/response.
+
+	state := event.OrderState
+	// If OrderState is empty/unknown, maybe fallback to Payment state?
+	// For now trust OrderState.
+
+	var feeTotalLoki, orderTotalLoki uint64
+	if event.Payment.Bolt11 != nil {
+		feeTotalLoki = event.Payment.Bolt11.FeeTotalLoki
+		orderTotalLoki = event.Payment.Bolt11.OrderTotalLoki
+	}
+
+	return map[string]interface{}{
+		"order_id":            event.OrderID,
+		"state":               state,
+		"payment_invoice":     invoice,
+		"fee_total_loki":      feeTotalLoki,
+		"order_total_loki":    orderTotalLoki,
+		"lsp_balance_loki":    event.Order.LspBalanceLoki,
+		"client_balance_loki": event.Order.ClientBalanceLoki,
+	}, nil
+}
+
+// LSPS2GetInfo requests JIT channel opening params
+func (api *api) LSPS2GetInfo(ctx context.Context, req *LSPS2GetInfoRequest) (interface{}, error) {
+	if api.svc.GetLiquidityManager() == nil {
+		return nil, fmt.Errorf("LiquidityManager not started")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, lspsRequestTimeout)
+	defer cancel()
+
+	fees, err := api.svc.GetLiquidityManager().GetLSPS2FeeParams(ctx, req.LSPPubkey)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			logger.Logger.Warn().Str("lsp", req.LSPPubkey).Msg("LSPS2 GetInfo timeout")
+			return nil, fmt.Errorf("time out, please retry")
+		}
+		logger.Logger.Error().Err(err).Str("lsp", req.LSPPubkey).Msg("LSPS2 GetInfo failed")
+		return nil, err
+	}
+
+	if len(fees) == 0 {
+		return nil, fmt.Errorf("no fee parameters provided by LSP")
+	}
+
+	// Return the first fee parameter set as a flat object
+	return fees[0], nil
+}
+
+// LSPS2Buy buys a JIT channel
+func (api *api) LSPS2Buy(ctx context.Context, req *LSPS2BuyRequest) (*LSPS2BuyResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, lspsRequestTimeout)
+	defer cancel()
+
+	if api.svc.GetLiquidityManager() == nil {
+		return nil, fmt.Errorf("LiquidityManager not started")
+	}
+
+	if req.PaymentSizeMloki == nil {
+		return nil, fmt.Errorf("payment_size_mloki is required")
+	}
+
+	// Use the new robust BuyLiquidity method which handles retries
+	hints, err := api.svc.GetLiquidityManager().BuyLiquidity(ctx, req.LSPPubkey, *req.PaymentSizeMloki, &req.OpeningFeeParams)
+	if err != nil {
+		logger.Logger.Error().Err(err).Str("lsp", req.LSPPubkey).Uint64("amount", *req.PaymentSizeMloki).Msg("LSPS2 BuyLiquidity failed")
+		return nil, err
+	}
+
+	// Helper to parse SCID string back to uint64 for response compatibility
+	scid, err := strconv.ParseUint(hints.SCID, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid SCID returned from manager: %w", err)
+	}
+
+	return &LSPS2BuyResponse{
+		// RequestID is less relevant in this abstracted flow, but we can leave it empty or generated if needed.
+		// The frontend typically just needs the SCID and CltvDelta.
+		RequestID:       "",
+		InterceptSCID:   scid,
+		CLTVExpiryDelta: hints.CLTVExpiryDelta,
+		LSPNodeID:       hints.LSPNodeID,
+	}, nil
+}
+
+// LSPS5SetWebhook registers a webhook
+func (api *api) LSPS5SetWebhook(ctx context.Context, req *LSPS5SetWebhookRequest) (interface{}, error) {
+	ctx, cancel := context.WithTimeout(ctx, lspsRequestTimeout)
+	defer cancel()
+
+	client := api.svc.GetLiquidityManager().LSPS5Client()
+	if client == nil {
+		return nil, fmt.Errorf("LSPS5 client not available")
+	}
+
+	// Assuming appName is "lokihub" or part of the request?
+	// The LSPS5SetWebhookRequest has URL, Events, Signature (optional?)
+	// The client.SetWebhook signature might strictly match.
+
+	// Assume https if not specified? Or maybe allow empty if inferred?
+	// The struct now has Transport field
+	transport := req.Transport
+	if transport == "" {
+		transport = "https"
+	}
+
+	reqID, err := client.SetWebhook(ctx, req.LSPPubkey, "lokihub", req.URL, transport)
+	if err != nil {
+		logger.Logger.Error().Err(err).Str("lsp", req.LSPPubkey).Str("url", req.URL).Msg("LSPS5 SetWebhook failed")
+		return nil, err
+	}
+
+	return map[string]string{"requestId": reqID}, nil
+}
+
+// LSPS5ListWebhooks lists webhooks
+func (api *api) LSPS5ListWebhooks(ctx context.Context, req *LSPS5ListWebhooksRequest) (interface{}, error) {
+	ctx, cancel := context.WithTimeout(ctx, lspsRequestTimeout)
+	defer cancel()
+
+	client := api.svc.GetLiquidityManager().LSPS5Client()
+	if client == nil {
+		return nil, fmt.Errorf("LSPS5 client not available")
+	}
+
+	reqID, err := client.ListWebhooks(ctx, req.LSPPubkey)
+	if err != nil {
+		logger.Logger.Error().Err(err).Str("lsp", req.LSPPubkey).Msg("LSPS5 ListWebhooks failed")
+		return nil, err
+	}
+
+	return map[string]string{"requestId": reqID}, nil
+}
+
+// LSPS5RemoveWebhook removes a webhook
+func (api *api) LSPS5RemoveWebhook(ctx context.Context, req *LSPS5RemoveWebhookRequest) (interface{}, error) {
+	ctx, cancel := context.WithTimeout(ctx, lspsRequestTimeout)
+	defer cancel()
+
+	client := api.svc.GetLiquidityManager().LSPS5Client()
+	if client == nil {
+		return nil, fmt.Errorf("LSPS5 client not available")
+	}
+
+	reqID, err := client.RemoveWebhook(ctx, req.LSPPubkey, req.URL)
+	if err != nil {
+		logger.Logger.Error().Err(err).Str("lsp", req.LSPPubkey).Str("url", req.URL).Msg("LSPS5 RemoveWebhook failed")
+		return nil, err
+	}
+
+	return map[string]string{"requestId": reqID}, nil
+}
+
+// Helper to parse host:port
+func parseHostPort(hostPort string) (string, uint16, error) {
+	parts := strings.Split(hostPort, ":")
+	if len(parts) != 2 {
+		return "", 0, fmt.Errorf("invalid host:port format: %s", hostPort)
+	}
+	port, err := strconv.ParseUint(parts[1], 10, 16)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid port number: %w", err)
+	}
+	return parts[0], uint16(port), nil
+}
+
+// connectLSP attempts to connect to the LSP peer
+func (api *api) connectLSP(ctx context.Context, pubkey string, host string) error {
+	address, port, err := parseHostPort(host)
+	if err != nil {
+		logger.Logger.Error().Err(err).Str("host", host).Msg("Failed to parse host:port for LSP connection")
+		return err
+	}
+
+	req := &ConnectPeerRequest{
+		Pubkey:  pubkey,
+		Address: address,
+		Port:    port,
+	}
+
+	if err := api.ConnectPeer(ctx, req); err != nil {
+		if strings.Contains(err.Error(), "already connected") {
+			logger.Logger.Info().Str("pubkey", pubkey).Msg("Peer already connected, ignoring error")
+			return nil
+		}
+		logger.Logger.Error().Err(err).Str("pubkey", pubkey).Msg("Failed to connect to LSP peer")
+		return err
+	}
+	return nil
+}
+
+// disconnectLSP disconnects the LSP peer
+func (api *api) disconnectLSP(ctx context.Context, pubkey string) error {
+	if err := api.DisconnectPeer(ctx, pubkey); err != nil {
+		if strings.Contains(err.Error(), "is not connected") {
+			logger.Logger.Info().Str("pubkey", pubkey).Msg("Peer already disconnected, ignoring error")
+			return nil
+		}
+		logger.Logger.Warn().Err(err).Str("pubkey", pubkey).Msg("Failed to disconnect peer")
+		return err
+	}
+	return nil
+}
+
+// checkHasChannels checks if there are any open channels with the given pubkey
+func (api *api) checkHasChannels(ctx context.Context, pubkey string) error {
+	if api.svc.GetLNClient() == nil {
+		return nil // Cannot check if client not ready, assume safe? Or block?
+		// If LNClient is nil, we probably can't delete anyway or it's safe.
+	}
+
+	channels, err := api.svc.GetLNClient().ListChannels(ctx)
+	if err != nil {
+		logger.Logger.Error().Err(err).Msg("Failed to list channels during LSP removal check")
+		return fmt.Errorf("failed to check for active channels")
+	}
+
+	for _, ch := range channels {
+		if strings.EqualFold(ch.RemotePubkey, pubkey) {
+			return fmt.Errorf("cannot remove LSP with open channels")
+		}
+	}
+	return nil
+}
+
+// HandleListLSPs returns all configured LSPs
+func (api *api) HandleListLSPs(ctx context.Context) ([]manager.SettingsLSP, error) {
+	// We want to return the format the frontend expects (SettingsLSP)
+	// which effectively merges DB data with active status.
+	// Since we now store everything in DB, we just map it.
+
+	// We use the same struct as manager for compatibility or define a new Response struct?
+	// Frontend expects: { name, pubkey, host, active }
+	// We can reuse manager.SettingsLSP for now.
+
+	dbLSPs, err := api.lspManager.ListLSPs()
+	if err != nil {
+		return nil, err
+	}
+
+	var result []manager.SettingsLSP
+	for _, l := range dbLSPs {
+		result = append(result, manager.SettingsLSP{
+			Name:        l.Name,
+			Description: l.Description,
+			Pubkey:      l.Pubkey,
+			Host:        l.Host,
+			Website:     l.Website,
+			Active:      l.IsActive,
+			IsCommunity: l.IsCommunity,
+		})
+	}
+	return result, nil
+}
+
+type AddLSPRequest struct {
+	Name   string `json:"name"`
+	Host   string `json:"host"` // Format: host:port
+	Pubkey string `json:"pubkey"`
+}
+
+// HandleAddLSP adds a new custom LSP
+func (api *api) HandleAddLSP(ctx context.Context, req *AddLSPRequest) (*manager.SettingsLSP, error) {
+	// Validate
+	if req.Name == "" || req.Host == "" || req.Pubkey == "" {
+		return nil, fmt.Errorf("name, host, and pubkey are required")
+	}
+
+	// Add to DB via LiquidityManager
+	uri := req.Pubkey + "@" + req.Host
+	if err := api.svc.GetLiquidityManager().AddLSP(req.Name, uri); err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) && !strings.Contains(err.Error(), "already exists") {
+			return nil, err
+		}
+		// If it exists, we proceed to ensure it's active and connected.
+		logger.Logger.Info().Str("pubkey", req.Pubkey).Msg("LSP already exists, ensuring it is active...")
+	}
+
+	// Force active=true for manually added LSPs and ensure DB is updated
+	if err := api.lspManager.ToggleLSP(req.Pubkey, true); err != nil {
+		return nil, fmt.Errorf("failed to activate LSP: %w", err)
+	}
+
+	// Try to connect (ignore already connected error)
+	if err := api.connectLSP(ctx, req.Pubkey, req.Host); err != nil {
+		// Specific check for self-connection attempt, which should fail the addition
+		if strings.Contains(err.Error(), "cannot make connection to self") {
+			// Rollback: remove the LSP we just added
+			if delErr := api.lspManager.DeleteCustomLSP(req.Pubkey); delErr != nil {
+				logger.Logger.Error().Err(delErr).Str("pubkey", req.Pubkey).Msg("Failed to rollback LSP addition after self-connection error")
+			}
+			return nil, fmt.Errorf("cannot add your own node as an LSP")
+		}
+
+		// Log but don't fail the addition for other connection errors (e.g. offline)
+		logger.Logger.Warn().Err(err).Str("pubkey", req.Pubkey).Msg("Failed to connect to new LSP")
+	}
+
+	return &manager.SettingsLSP{
+		Name:   req.Name,
+		Pubkey: req.Pubkey,
+		Host:   req.Host,
+		Active: true,
+	}, nil
+}
+
+type UpdateLSPRequest struct {
+	Active bool `json:"active"`
+}
+
+// HandleUpdateLSP updates LSP status (Toggle)
+func (api *api) HandleUpdateLSP(ctx context.Context, pubkey string, req *UpdateLSPRequest) error {
+	lm := api.svc.GetLiquidityManager()
+	if req.Active {
+		// Need host to connect. Fetch LSP first.
+		lsps, err := api.lspManager.ListLSPs()
+		if err != nil {
+			return err
+		}
+		var target *persist.LSP
+		for i := range lsps {
+			if strings.EqualFold(lsps[i].Pubkey, pubkey) {
+				target = &lsps[i]
+				break
+			}
+		}
+		if target == nil {
+			return errors.New("LSP not found")
+		}
+
+		if err := lm.SetActiveLSP(pubkey); err != nil {
+			return err
+		}
+		// Connect
+		if err := api.connectLSP(ctx, pubkey, target.Host); err != nil {
+			return err
+		}
+	} else {
+		// Check for active channels before removing/deactivating
+		if err := api.checkHasChannels(ctx, pubkey); err != nil {
+			return err
+		}
+
+		if err := lm.RemoveSelectedLSP(pubkey); err != nil {
+			return err
+		}
+		// Disconnect
+		if err := api.disconnectLSP(ctx, pubkey); err != nil {
+			logger.Logger.Warn().Err(err).Str("lsp", pubkey).Msg("Failed to disconnect LSP")
+		}
+	}
+	return nil
+}
+
+// HandleDeleteLSP removes a custom LSP
+func (api *api) HandleDeleteLSP(ctx context.Context, pubkey string) error {
+	// Check for active channels before removing
+	if err := api.checkHasChannels(ctx, pubkey); err != nil {
+		return err
+	}
+
+	lm := api.svc.GetLiquidityManager()
+	if err := lm.RemoveLSP(pubkey); err != nil {
+		return err
+	}
+	// Disconnect
+	return api.disconnectLSP(ctx, pubkey)
+}
+
+// Keeping legacy simplified methods for internal use if needed, but delegating
+func (api *api) ListLSPs() ([]manager.SettingsLSP, error) {
+	return api.HandleListLSPs(context.Background())
+}
+
+// AddLSP adds a new LSP to configuration (Legacy wrapper)
+func (api *api) AddLSP(name, uri string) error {
+	pubkey, host, err := utils.ParseLSPURI(uri)
+	if err != nil {
+		return err
+	}
+	// Call HandleAddLSP which handles DB + Connection
+	_, err = api.HandleAddLSP(context.Background(), &AddLSPRequest{
+		Name:   name,
+		Pubkey: pubkey,
+		Host:   host,
+	})
+	return err
+}
+
+// RemoveLSP removes an LSP (Legacy wrapper)
+func (api *api) RemoveLSP(pubkey string) error {
+	return api.HandleDeleteLSP(context.Background(), pubkey)
+}
+
+// AddSelectedLSP activates an LSP (Legacy wrapper)
+func (api *api) AddSelectedLSP(pubkey string) error {
+	return api.HandleUpdateLSP(context.Background(), pubkey, &UpdateLSPRequest{Active: true})
+}
+
+// RemoveSelectedLSP deactivates an LSP (Legacy wrapper)
+func (api *api) RemoveSelectedLSP(pubkey string) error {
+	return api.HandleUpdateLSP(context.Background(), pubkey, &UpdateLSPRequest{Active: false})
+}
+
+// GetSelectedLSPs returns active LSPs (Legacy wrapper)
+func (api *api) GetSelectedLSPs() ([]manager.SettingsLSP, error) {
+	lsps, err := api.HandleListLSPs(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	var selected []manager.SettingsLSP
+	for _, l := range lsps {
+		if l.Active {
+			selected = append(selected, l)
+		}
+	}
+	return selected, nil
+}
+
+// saveLSPsToDatabase saves LSPs directly using LSPManager during setup
+func (api *api) saveLSPsToDatabase(lsps []LSPSettingInput) error {
+	ctx := context.Background()
+	for _, input := range lsps {
+		pubkey, host, err := utils.ParseLSPURI(input.Pubkey + "@" + input.Host)
+		if err != nil {
+			logger.Logger.Warn().Err(err).Str("name", input.Name).Msg("Invalid LSP URI in setup")
+			continue
+		}
+
+		existing, err := api.lspManager.AddLSP(input.Name, pubkey, host, input.Active, input.IsCommunity)
+		if err != nil {
+			if err.Error() == "LSP with this pubkey already exists" {
+				// Update active status
+				if err := api.lspManager.ToggleLSP(pubkey, input.Active); err != nil {
+					logger.Logger.Error().Err(err).Str("pubkey", pubkey).Msg("Failed to update LSP active status in setup")
+				}
+			} else {
+				logger.Logger.Error().Err(err).Str("name", input.Name).Msg("Failed to add LSP in setup")
+			}
+		} else {
+			_ = existing
+		}
+
+		// Handle connection state
+		if input.Active {
+			go func(pk, h string) {
+				// Check if we can connect
+				if api.svc.GetLNClient() == nil {
+					return
+				}
+				if err := api.connectLSP(ctx, pk, h); err != nil {
+					logger.Logger.Warn().Err(err).Str("pubkey", pk).Msg("Failed to connect to LSP in setup")
+				}
+			}(pubkey, host)
+		} else {
+			go func(pk string) {
+				if err := api.disconnectLSP(ctx, pk); err != nil {
+					logger.Logger.Warn().Err(err).Str("pubkey", pk).Msg("Failed to disconnect LSP in setup")
+				}
+			}(pubkey)
+		}
+	}
+
+	return nil
+}
+
+// UpdateLSPS1OrderState updates the state of an LSPS1 order from a webhook
+// notification. The caller (lsps5WebhookCallbackHandler) has already verified
+// lspPubkey via a signature, but that only proves the sender controls
+// lspPubkey — not that lspPubkey is a real LSP this hub trusts, nor that it's
+// the specific LSP that owns orderID. Both are checked here so a notification
+// self-signed by any keypair can't forge a state transition for an order it
+// doesn't own.
+func (api *api) UpdateLSPS1OrderState(ctx context.Context, lspPubkey, orderID, state string) error {
+	// Ownership is checked before touching the LiquidityManager at all: it's a
+	// pure authorization decision against api.lspManager (always available,
+	// doesn't depend on whether the manager has started), and rejecting a
+	// forged notification shouldn't be gated on unrelated service state.
+	order, err := api.lspManager.GetOrder(orderID)
+	if err != nil {
+		return fmt.Errorf("order %s not found: %w", orderID, err)
+	}
+	if order.LSPPubkey != lspPubkey {
+		return fmt.Errorf("lsp pubkey does not match the LSP that created order %s", orderID)
+	}
+	if api.svc.GetLiquidityManager() == nil {
+		return fmt.Errorf("LiquidityManager not started")
+	}
+	api.svc.GetLiquidityManager().HandleOrderStateUpdate(orderID, state, lspPubkey)
+	return nil
+}
+
+func (api *api) LSPS1ListOrders(ctx context.Context) (*LSPS1ListOrdersResponse, error) {
+	if api.svc.GetLiquidityManager() == nil {
+		return nil, fmt.Errorf("LiquidityManager not started")
+	}
+	orders, err := api.svc.GetLiquidityManager().ListLSPS1Orders()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &LSPS1ListOrdersResponse{
+		Orders: make([]LSPS1Order, len(orders)),
+	}
+
+	for i, o := range orders {
+		response.Orders[i] = LSPS1Order{
+			OrderID:           o.OrderID,
+			LSPPubkey:         o.LSPPubkey,
+			State:             o.State,
+			PaymentInvoice:    o.PaymentInvoice,
+			FeeTotal:          o.FeeTotal,
+			OrderTotal:        o.OrderTotal,
+			LSPBalanceLoki:    o.LSPBalance,
+			ClientBalanceLoki: o.ClientBalance,
+			CreatedAt:         o.CreatedAt,
+			UpdatedAt:         o.UpdatedAt,
+		}
+	}
+
+	return response, nil
+}

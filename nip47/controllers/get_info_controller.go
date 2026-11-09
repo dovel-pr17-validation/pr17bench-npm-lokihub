@@ -1,0 +1,153 @@
+package controllers
+
+import (
+	"context"
+	"encoding/json"
+
+	"github.com/flokiorg/lokihub/constants"
+	"github.com/flokiorg/lokihub/db"
+	"github.com/flokiorg/lokihub/db/queries"
+	"github.com/flokiorg/lokihub/logger"
+	"github.com/flokiorg/lokihub/nip47/models"
+	"github.com/nbd-wtf/go-nostr"
+)
+
+type circleWalletInfo struct {
+	AvailableMillis int64  `json:"available_millis"`
+	MaxExpSecs      int    `json:"max_exp_secs"`
+	FeesPpm         int    `json:"fees_ppm"`
+	CirclePolicy    string `json:"circle_policy"`
+	// Identity is the node key that signs the kind-11190 announcement. Present only
+	// while the private transport runs, so clients know Private Join is offered.
+	Identity string `json:"identity,omitempty"`
+}
+
+type getInfoResponse struct {
+	Alias       *string  `json:"alias"`
+	Color       *string  `json:"color"`
+	Pubkey      *string  `json:"pubkey"`
+	Network     *string  `json:"network"`
+	BlockHeight *uint32  `json:"block_height"`
+	BlockHash   *string  `json:"block_hash"`
+	Methods     []string `json:"methods"`
+	// PrivateMethods names granted methods this connection does NOT serve, because they
+	// travel over the NIP-CASH private transport (§Scope Surface). Omitted when empty, so
+	// only a bill carries it.
+	//
+	// Without it there is no wire-level signal that the bill methods exist at all: they
+	// were removed from Methods because 23194 refuses them, and the kind-11190
+	// announcement carries only inbox, limits and relays.
+	PrivateMethods   []string          `json:"private_methods,omitempty"`
+	Notifications    []string          `json:"notifications"`
+	Metadata         interface{}       `json:"metadata,omitempty"`
+	LightningAddress *string           `json:"lud16"`
+	CircleWallet     *circleWalletInfo `json:"circle_wallet,omitempty"`
+}
+
+func (controller *nip47Controller) HandleGetInfoEvent(ctx context.Context, nip47Request *models.Request, requestEventId uint, app *db.App, publishResponse publishFunc) {
+	supportedNotifications := []string{}
+	if controller.permissionsService.PermitsNotifications(app) {
+		supportedNotifications = controller.lnClient.GetSupportedNIP47NotificationTypes()
+	}
+
+	responsePayload := &getInfoResponse{
+		Methods: controller.permissionsService.GetPermittedMethods(app, controller.lnClient),
+		// The complement of Methods: granted, but served on the private transport. Derived
+		// from this app's own grants, so it never claims a method this bill lacks.
+		PrivateMethods: controller.permissionsService.GetPrivateMethods(app),
+		Notifications:  supportedNotifications,
+	}
+
+	// basic permissions check
+	// this is inconsistent with other methods. Ideally we move fetching node info to a separate method,
+	// so that get_info does not require its own scope. This would require a change in the NIP-47 spec.
+	hasPermission, _, _ := controller.permissionsService.HasPermission(app, constants.GET_INFO_SCOPE)
+	if hasPermission {
+		logger.Logger.Debug().
+			Interface("request_event_id", requestEventId).
+			Msg("Getting info")
+
+		info, err := controller.lnClient.GetInfo(ctx)
+		if err != nil {
+			logger.Logger.Info().Err(err).
+				Interface("request_event_id", requestEventId).
+				Msg("Failed to fetch node info")
+
+			publishResponse(&models.Response{
+				ResultType: nip47Request.Method,
+				Error:      mapNip47Error(err),
+			}, nostr.Tags{})
+			return
+		}
+
+		network := info.Network
+		// Some implementations return "flokicoin" while NIP47 expects "mainnet"
+		if network == "flokicoin" {
+			network = "mainnet"
+		}
+
+		responsePayload.Alias = &info.Alias
+		responsePayload.Color = &info.Color
+		responsePayload.Pubkey = &info.Pubkey
+		responsePayload.Network = &network
+		responsePayload.BlockHeight = &info.BlockHeight
+		responsePayload.BlockHash = &info.BlockHash
+
+		if app != nil {
+			metadata := map[string]interface{}{}
+			if app.Metadata != nil {
+				jsonErr := json.Unmarshal(app.Metadata, &metadata)
+				if jsonErr != nil {
+					logger.Logger.Error().Err(jsonErr).
+						Uint("id", app.ID).
+						Interface("metadata", app.Metadata).
+						Msg("Failed to deserialize app metadata")
+				}
+			}
+			if metadata["id"] == nil {
+				metadata["id"] = app.ID
+			}
+			if metadata["name"] == nil {
+				metadata["name"] = app.Name
+			}
+			if !app.IsIsolated() {
+				lightningAddress, _ := controller.cfg.Get("LightningAddress", "")
+				responsePayload.LightningAddress = &lightningAddress
+			} else if metadata["app_store_app_id"] == constants.SUBWALLET_APPSTORE_APP_ID && metadata["lud16"] != nil {
+				lightningAddress := metadata["lud16"].(string)
+				responsePayload.LightningAddress = &lightningAddress
+			}
+
+			responsePayload.Metadata = metadata
+		}
+	}
+
+	// A circle_hub always answers with its terms, whatever its scopes: NIP-CW makes
+	// the circle_wallet block what identifies a Hub at all, and hubs created from
+	// lokihub's own UI hold no get_info scope.
+	if app != nil && app.Kind == db.AppKindCircleHub {
+		balance := queries.GetIsolatedBalance(controller.db, app.ID)
+		commitment, _ := queries.GetCircleCommitmentMloki(controller.db, app.ID)
+		available := balance - commitment
+		if available < 0 {
+			available = 0
+		}
+		providerConfig, err := controller.appsService.GetCircleHubConfig(app.ID)
+		if err == nil {
+			responsePayload.CircleWallet = &circleWalletInfo{
+				AvailableMillis: available,
+				MaxExpSecs:      providerConfig.MaxExpSecs,
+				FeesPpm:         providerConfig.FeesPpm,
+				CirclePolicy:    providerConfig.CircleIdentity.Policy,
+			}
+			if controller.privateIdentity != nil {
+				responsePayload.CircleWallet.Identity = controller.privateIdentity()
+			}
+		}
+	}
+
+	publishResponse(&models.Response{
+		ResultType: nip47Request.Method,
+		Result:     responsePayload,
+	}, nostr.Tags{})
+}

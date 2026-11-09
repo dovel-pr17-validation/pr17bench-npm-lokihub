@@ -1,0 +1,1226 @@
+import {
+  ArrowRightLeftIcon,
+  BellIcon,
+  CirclePlusIcon,
+  CrownIcon,
+  GiftIcon,
+  HandCoinsIcon,
+  InfoIcon,
+  LucideIcon,
+  MergeIcon,
+  NetworkIcon,
+  NotebookTabsIcon,
+  PenLineIcon,
+  SearchIcon,
+  UsersIcon,
+  WalletMinimalIcon,
+} from "lucide-react";
+
+export type BackendType = "FLND";
+
+export type Nip47RequestMethod =
+  | "get_info"
+  | "get_balance"
+  | "get_budget"
+  | "make_invoice"
+  | "pay_invoice"
+  | "pay_keysend"
+  | "lookup_invoice"
+  | "list_transactions"
+  | "sign_message"
+  | "multi_pay_invoice"
+  | "multi_pay_keysend"
+  | "make_hold_invoice"
+  | "settle_hold_invoice"
+  | "cancel_hold_invoice";
+
+export type BudgetRenewalType =
+  | "daily"
+  | "weekly"
+  | "monthly"
+  | "yearly"
+  | "never"
+  | "";
+
+export type Scope =
+  | "pay_invoice" // also used for pay_keysend, multi_pay_invoice, multi_pay_keysend
+  | "get_balance"
+  | "get_info"
+  | "make_invoice"
+  | "lookup_invoice"
+  | "list_transactions"
+  | "sign_message"
+  | "notifications" // covers all notification types
+  | "superuser"
+  | "cash_hub"
+  | "circle_wallet"
+  | "cash_redeem"
+  | "cash_transfer"
+  | "cash_consolidate";
+
+export type Nip47NotificationType = "payment_received" | "payment_sent";
+
+export type ScopeIconMap = {
+  [key in Scope]: LucideIcon;
+};
+
+export const scopeIconMap: ScopeIconMap = {
+  get_balance: WalletMinimalIcon,
+  get_info: InfoIcon,
+  list_transactions: NotebookTabsIcon,
+  lookup_invoice: SearchIcon,
+  make_invoice: CirclePlusIcon,
+  pay_invoice: HandCoinsIcon,
+  sign_message: PenLineIcon,
+  notifications: BellIcon,
+  superuser: CrownIcon,
+  cash_hub: NetworkIcon,
+  circle_wallet: UsersIcon,
+  cash_redeem: GiftIcon,
+  cash_transfer: ArrowRightLeftIcon,
+  cash_consolidate: MergeIcon,
+};
+
+export type WalletCapabilities = {
+  methods: Nip47RequestMethod[];
+  scopes: Scope[];
+  notificationTypes: Nip47NotificationType[];
+};
+
+export const validBudgetRenewals: BudgetRenewalType[] = [
+  "daily",
+  "weekly",
+  "monthly",
+  "yearly",
+  "never",
+];
+
+export const scopeDescriptions: Record<Scope, string> = {
+  get_balance: "Read your balance",
+  get_info: "Read your node info",
+  list_transactions: "Read transaction history",
+  lookup_invoice: "Lookup status of invoices",
+  make_invoice: "Create invoices",
+  pay_invoice: "Send payments",
+  sign_message: "Sign messages",
+  notifications: "Receive wallet notifications",
+  superuser: "Create other app connections",
+  cash_hub: "Mint Lokicash from your balance",
+  circle_wallet: "Issue wallets to your circle's members",
+  cash_redeem: "Claim your allocated share of a shared cash bill",
+  cash_transfer: "Transfer or split an unclaimed share to someone else",
+  cash_consolidate: "Combine several Cash tokens from the same Hub into one",
+};
+
+export const expiryOptions: Record<string, number> = {
+  "1 week": 7,
+  "1 month": 30,
+  "1 year": 365,
+  Never: 0,
+};
+
+export const budgetOptions: Record<string, number> = {
+  "21": 21_000,
+  "500": 500_000,
+  "21M": 21_000_000,
+  Unlimited: 0,
+};
+
+export interface ErrorResponse {
+  message: string;
+  // Set only by the startup-error handler (see STARTUP_ERROR_CODE).
+  code?: string;
+  version?: string;
+}
+
+export interface App {
+  id: number;
+  name: string;
+  description: string;
+  appPubkey: string;
+  uniqueWalletPubkey: boolean;
+  walletPubkey: string;
+  createdAt: string;
+  updatedAt: string;
+  lastUsedAt?: string;
+  expiresAt?: string;
+  isolated: boolean;
+  kind?: string;
+  // parentAppId/parentKind are set only on a Cash/Circle Hub's own children
+  // (cash_wallet/circle_wallet), identifying which specific hub issued
+  // them — used to group siblings under the same hub in the connection
+  // switcher, instead of the hub's own id/kind.
+  parentAppId?: number;
+  parentKind?: string;
+  balance: number;
+
+  scopes: Scope[];
+  maxAmount: number;
+  budgetUsage: number;
+  budgetRenewal: BudgetRenewalType;
+  metadata?: AppMetadata;
+  // circleIdentity is set only for circle_hub apps — a lightweight
+  // summary of the attached (possibly shared) identity plus policy-specific
+  // counts, so the Circles card doesn't need an extra round-trip per app.
+  // followingCount is undefined (not 0) when not yet known — the backend
+  // only ever returns it from a non-blocking cache peek, never a live fetch,
+  // so a brand-new following-policy identity should render as still-loading
+  // rather than "0 following" until the periodic refresher populates it.
+  circleIdentity?: CircleIdentitySummary & {
+    followingCount?: number;
+    allowlistCount: number;
+    // policySyncedAt is "last policy update" — when membership was last
+    // confirmed from its source of truth (relay fetch for "following", last
+    // allowlist add/remove for "allowlist"). Undefined (not "never") when not
+    // yet known, same loading semantics as followingCount.
+    policySyncedAt?: string;
+  };
+  // cashPerWalletMaxMloki/cashMaxExpSecs/cashMinTransferMloki/cashRedeemFeePpm
+  // are set only for cash_hub apps — the hub-wide defaults set at creation
+  // time, editable from Edit Connection. cashMinTransferMloki (0 = no floor)
+  // is the default floor a freshly-minted wallet's slices inherit for
+  // cash_transfer splitting. cashRedeemFeePpm (0 = free) is the default
+  // per-million cash_redeem fee a freshly-minted wallet's slices inherit,
+  // charged only on a genuine external redemption.
+  cashPerWalletMaxMloki?: number;
+  cashMaxExpSecs?: number;
+  cashMinTransferMloki?: number;
+  cashRedeemFeePpm?: number;
+  // cashSpentRetentionSecs is how long the hub keeps answering cash_status
+  // about a bill it has destroyed, with a "spent" tombstone, before falling
+  // silent again. 0 disables it. Without it a spent bill and an unreachable
+  // hub are the same timeout, so a client has to guess which.
+  cashSpentRetentionSecs?: number;
+  // circleMaxExpSecs/circleFeesPpm/circlePerWalletMaxMloki/circleMinBudgetRenewal
+  // are set only for circle_hub apps, for the same reason as above.
+  circleMaxExpSecs?: number;
+  circleFeesPpm?: number;
+  circlePerWalletMaxMloki?: number;
+  circleMinBudgetRenewal?: BudgetRenewalType;
+}
+
+export interface CircleIdentitySummary {
+  id: number;
+  name: string;
+  policy: "following" | "allowlist";
+  providerPubkey: string;
+  // How many circle_hub apps currently reference this identity — an
+  // identity with usedByCount > 0 can't be deleted until those are removed.
+  usedByCount: number;
+}
+
+export interface CircleIdentityResponse extends CircleIdentitySummary {
+  followingCount?: number;
+  allowlistCount: number;
+  allowlistPubkeys?: string[];
+  usedByCount: number;
+}
+
+// CircleRefreshPreview is the delta a following-policy allowlist refresh
+// would apply, plus the full freshly-fetched list — confirming applies
+// `pubkeys` directly rather than re-fetching from relays a second time, so
+// what's applied always matches exactly what was shown for review.
+export interface CircleRefreshPreview {
+  pubkeys: string[];
+  added: string[];
+  removed: string[];
+}
+
+export interface AppPermissions {
+  scopes: Scope[];
+  maxAmount: number;
+  budgetRenewal: BudgetRenewalType;
+  expiresAt?: Date;
+  isolated: boolean;
+  // cashHub/cashPerWalletMaxLoki/cashMaxExpSecs are only meaningful for a new
+  // connection (isNewConnection) — they select kind "cash_hub" instead of
+  // "isolated" at creation time and are never editable afterward here (see
+  // AppDetails' dedicated Hub Settings card for that).
+  cashHub?: boolean;
+  cashPerWalletMaxLoki?: number;
+  cashMaxExpSecs?: number;
+}
+
+export interface LSP {
+  name: string;
+  pubkey: string;
+  host: string;
+  active: boolean;
+  isCommunity?: boolean;
+  description?: string;
+  website?: string;
+}
+
+export interface InfoResponse {
+  backendType: BackendType;
+  setupCompleted: boolean;
+  running: boolean;
+  network?: Network;
+  version: string;
+  relays: { url: string; online: boolean }[];
+  unlocked: boolean;
+  startupState: string;
+  startupError: string;
+  startupErrorTime: string;
+  autoUnlockPasswordSupported: boolean;
+  autoUnlockPasswordEnabled: boolean;
+  currency: string;
+  nodeAlias: string;
+  mempoolUrl: string;
+  flokicoinDisplayFormat: FlokicoinDisplayFormat;
+  lokihubServicesURL: string;
+  swapServiceUrl: string;
+  messageboardNwcUrl: string;
+  relay: string;
+  trustedNwcRelay: boolean;
+  generalRelay: string;
+  // privateTransport is the hub's NIP-CASH private-transport announcement
+  // status (read-only). nodeIdentity/inboxPubkey are x-only hex (Nostr
+  // pubkey format). announced is false, with error explaining why, when the
+  // hub's LN backend can't sign the announcement or no relay accepted it —
+  // bill methods are unreachable to any client that hasn't talked to this
+  // hub before until it is.
+  privateTransport: {
+    nodeIdentity?: string;
+    inboxPubkey?: string;
+    announced: boolean;
+    announcedRelays: number;
+    totalRelays: number;
+    error?: string;
+  };
+  searchRelay: string;
+  lsps: LSP[];
+  enableSwap: boolean;
+  enableMessageboardNwc: boolean;
+  workDir: string;
+  enablePolling?: boolean;
+}
+
+export type FlokicoinDisplayFormat = "loki" | "flc" | "auto";
+
+export type HealthAlarmKind =
+  | "node_not_ready"
+  | "channels_offline"
+  | "nostr_relay_offline"
+  | "vss_no_subscription";
+
+export type HealthAlarm = {
+  kind: HealthAlarmKind;
+  rawDetails?: unknown;
+};
+
+export type HealthResponse = {
+  alarms: HealthAlarm[];
+  message?: string;
+};
+
+export type Network = "flokicoin" | "testnet" | "signet";
+
+export type AppMetadata = {
+  app_store_app_id?: string;
+  lud16?: string;
+  // Full nostr pubkey behind a Cash/circle wallet's identity, stored for
+  // display purposes (resolving a profile name instead of the npub prefix
+  // baked into the app name). "identity_pubkey" for Cash wallets (pubkey mode
+  // at creation, connection_key mode once claimed), "requester_pubkey" for
+  // circle wallets.
+  identity_pubkey?: string;
+  requester_pubkey?: string;
+} & Record<string, unknown>;
+
+export type AutoSwapConfig = {
+  type: "out";
+  enabled: boolean;
+  balanceThreshold: number;
+  swapAmount: number;
+  destination: string;
+};
+
+export type SwapInfo = {
+  lokiServiceFee: number;
+  boltzServiceFee: number;
+  boltzNetworkFee: number;
+  minAmount: number;
+  maxAmount: number;
+};
+
+export type BaseSwap = {
+  id: string;
+  sendAmount: number;
+  lockupAddress: string;
+  paymentHash: string;
+  invoice: string;
+  autoSwap: boolean;
+  usedXpub: boolean;
+  boltzPubkey: string;
+  createdAt: string;
+  updatedAt: string;
+  lockupTxId?: string;
+  claimTxId?: string;
+  receiveAmount?: number;
+};
+
+export type SwapIn = BaseSwap & {
+  type: "in";
+  state: "PENDING" | "SUCCESS" | "FAILED" | "REFUNDED";
+  refundAddress?: string;
+};
+
+export type SwapOut = BaseSwap & {
+  type: "out";
+  state: "PENDING" | "SUCCESS" | "FAILED";
+  destinationAddress: string;
+};
+
+export type Swap = SwapIn | SwapOut;
+
+export type SwapResponse = {
+  swapId: string;
+  paymentHash: string;
+};
+
+export interface MnemonicResponse {
+  mnemonic: string;
+}
+
+export interface CreateAppRequest {
+  name: string;
+  pubkey?: string;
+  maxAmount?: number;
+  budgetRenewal?: BudgetRenewalType;
+  expiresAt?: string;
+  scopes: Scope[];
+  returnTo?: string;
+  kind?: string;
+  cashPerWalletMaxMloki?: number;
+  cashMaxExpSecs?: number;
+  cashMinTransferMloki?: number;
+  cashRedeemFeePpm?: number;
+  // Omitted means the hub's default retention, NOT disabled — 0 is the
+  // explicit opt-out. See App.cashSpentRetentionSecs.
+  cashSpentRetentionSecs?: number;
+  circleMaxExpSecs?: number;
+  circleFeesPpm?: number;
+  circlePerWalletMaxMloki?: number;
+  circleMinBudgetRenewal?: BudgetRenewalType;
+  // circleIdentityId reuses an existing CircleIdentity — when set,
+  // circleIdentityName/circlePolicy/providerPubkey below are ignored.
+  circleIdentityId?: number;
+  // circleIdentityName/circlePolicy/providerPubkey create a brand-new
+  // CircleIdentity — used only when circleIdentityId is not set.
+  circleIdentityName?: string;
+  circlePolicy?: string;
+  providerPubkey?: string;
+  metadata?: AppMetadata;
+  unlockPassword?: string; // required to create superuser apps
+}
+
+export interface CreateAppResponse {
+  id: number;
+  name: string;
+  pairingUri: string;
+  pairingPublicKey: string;
+  pairingSecretKey: string;
+  relayUrls: string[];
+  walletPubkey: string;
+  lud16: string;
+  returnTo: string;
+  // Alternative bech32 encoding of the same pairing data as pairingUri
+  // (ohstr/nips NIP-CASH.md §The Cash Hub Connection, NIP-CW.md §The Circle
+  // Wallet Hub Connection) — present only when kind is cash_hub/circle_hub
+  // respectively.
+  cashHubToken?: string;
+  circleHubToken?: string;
+}
+
+export type CircleDeleteMode = "all" | "empty_only";
+
+export interface CircleChildBalance {
+  appId: number;
+  name: string;
+  requesterPubkey: string;
+  appPubkey: string;
+  balanceMloki: number;
+}
+
+export interface ListCircleChildrenBalancesResponse {
+  children: CircleChildBalance[];
+  totalCount: number;
+}
+
+export interface DeleteCircleHubResult {
+  hubDeleted: boolean;
+  deletedChildIds: number[];
+  skippedChildIds: number[];
+}
+
+export type UpdateAppRequest = {
+  name?: string;
+  maxAmount?: number;
+  budgetRenewal?: string;
+  expiresAt?: string | undefined;
+  updateExpiresAt?: boolean;
+  scopes?: Scope[];
+  metadata?: AppMetadata;
+  isolated?: boolean;
+  // cash_hub only
+  cashPerWalletMaxMloki?: number;
+  cashMaxExpSecs?: number;
+  cashMinTransferMloki?: number;
+  cashRedeemFeePpm?: number;
+  cashSpentRetentionSecs?: number;
+  // circle_hub only
+  circleMaxExpSecs?: number;
+  circleFeesPpm?: number;
+  circlePerWalletMaxMloki?: number;
+  circleMinBudgetRenewal?: BudgetRenewalType;
+};
+
+export type Channel = {
+  localBalance: number;
+  localSpendableBalance: number;
+  remoteBalance: number;
+  remotePubkey: string;
+  id: string;
+  fundingTxId: string;
+  fundingTxVout: number;
+  active: boolean;
+  public: boolean;
+  confirmations?: number;
+  confirmationsRequired?: number;
+  forwardingFeeBaseMloki: number;
+  forwardingFeeProportionalMillionths: number;
+  unspendablePunishmentReserve: number;
+  counterpartyUnspendablePunishmentReserve: number;
+  error?: string;
+  status: "online" | "opening" | "offline";
+  isOutbound: boolean;
+};
+
+export type UpdateChannelRequest = {
+  forwardingFeeBaseMloki: number;
+};
+
+export type Peer = {
+  nodeId: string;
+  address: string;
+  isPersisted: boolean;
+  isConnected: boolean;
+};
+
+export type NodeConnectionInfo = {
+  pubkey: string;
+  address: string;
+  port: number;
+};
+
+export type ConnectPeerRequest = {
+  pubkey: string;
+  address: string;
+  port: number;
+};
+
+export type SignMessageRequest = {
+  message: string;
+};
+
+export type SignMessageResponse = {
+  message: string;
+  signature: string;
+};
+
+export type PayInvoiceResponse = {
+  preimage: string;
+  fee: number;
+};
+
+export type CreateInvoiceRequest = {
+  amount: number;
+  description: string;
+  lspJitChannelSCID?: string;
+  lspCltvExpiryDelta?: number;
+  lspPubkey?: string;
+  lspFeeBaseMloki?: number;
+  lspFeeProportionalMillionths?: number;
+};
+
+export type OpenChannelRequest = {
+  pubkey: string;
+  amountLoki: number;
+  public: boolean;
+};
+
+export type OpenChannelResponse = {
+  fundingTxId: string;
+};
+
+// eslint-disable-next-line @typescript-eslint/ban-types
+export type CloseChannelResponse = {};
+
+export type PendingBalancesDetails = {
+  channelId: string;
+  nodeId: string;
+  amount: number;
+  fundingTxId: string;
+  fundingTxVout: number;
+};
+
+export type OnchainBalanceResponse = {
+  spendable: number;
+  total: number;
+  reserved: number;
+  pendingBalancesFromChannelClosures: number;
+  pendingBalancesDetails: PendingBalancesDetails[];
+  pendingSweepBalancesDetails: PendingBalancesDetails[];
+};
+
+export type MempoolUtxo = {
+  txid: string;
+  vout: number;
+  status: {
+    confirmed: boolean;
+    block_height?: number;
+    block_hash?: string;
+    block_time?: number;
+  };
+  value: number;
+};
+
+export type MempoolNode = {
+  alias: string;
+  public_key: string;
+  color: string;
+  active_channel_count: number;
+  sockets: string;
+};
+
+export type MempoolTransaction = {
+  txid: string;
+  //version: 1,
+  //locktime: 0,
+  // vin: [],
+  //vout: [],
+  size: number;
+  weight: number;
+  fee: number;
+  status:
+    | {
+        confirmed: true;
+        block_height: number;
+        block_hash: string;
+        block_time: number;
+      }
+    | { confirmed: false };
+};
+
+export type LongUnconfirmedZeroConfChannel = { id: string; message: string };
+
+export type SetupNodeInfo = Partial<{
+  backendType: BackendType;
+
+  mnemonic?: string;
+  nextBackupReminder?: string;
+
+  flndAddress?: string;
+  flndCertHex?: string;
+  flndMacaroonHex?: string;
+
+  autoConnect?: boolean;
+  // customConfig removed
+
+  lokihubServicesURL?: string;
+  swapServiceUrl?: string;
+  relay?: string;
+  messageboardNwcUrl?: string;
+  mempoolApi?: string;
+  enableSwap?: boolean;
+  enableMessageboardNwc?: boolean;
+  lsps?: LSP[];
+}>;
+
+export type LSPType = "LSPS1";
+
+export type LokiInfo = {
+  version: string;
+  releaseNotes: string; // Markdown format
+};
+
+export type FlokicoinRate = {
+  code: string;
+  symbol: string;
+  rate: string;
+  rate_float: number;
+};
+
+// TODO: use camel case (needs mapping in the Loki OAuth Service - see how LokiInfo is done above)
+export type LokiMe = {
+  identifier: string;
+  nostr_pubkey: string;
+  lightning_address: string;
+  email: string;
+  name: string;
+  avatar: string;
+  keysend_pubkey: string;
+  shared_node: boolean;
+  hub: {
+    name?: string;
+    config?: {
+      region?: string;
+    };
+  };
+  subscription: {
+    plan_code: string;
+  };
+};
+
+export type LSPOrderRequest = {
+  amount: number;
+  lspType: LSPType;
+  lspIdentifier: string;
+  public: boolean;
+};
+
+export type LSPOrderResponse = {
+  invoice?: string;
+  fee: number;
+  invoiceAmount: number;
+  incomingLiquidity: number;
+  outgoingLiquidity: number;
+};
+
+export type AutoChannelRequest = {
+  isPublic: boolean;
+};
+export type AutoChannelResponse = {
+  invoice?: string;
+  fee?: number;
+  channelSize: number;
+};
+
+export type RedeemOnchainFundsResponse = {
+  txId: string;
+};
+
+export type LightningBalanceResponse = {
+  totalSpendable: number;
+  totalReceivable: number;
+  nextMaxSpendable: number;
+  nextMaxReceivable: number;
+  nextMaxSpendableMPP: number;
+  nextMaxReceivableMPP: number;
+};
+
+export type BalancesResponse = {
+  onchain: OnchainBalanceResponse;
+  lightning: LightningBalanceResponse;
+};
+
+export type Transaction = {
+  type: "incoming" | "outgoing";
+  state: "settled" | "pending" | "failed";
+  appId: number | undefined;
+  invoice: string;
+  description: string;
+  descriptionHash: string;
+  preimage: string | undefined;
+  paymentHash: string;
+  amount: number;
+  feesPaid: number;
+  updatedAt: string;
+  createdAt: string;
+  settledAt: string | undefined;
+  metadata?: TransactionMetadata;
+  boostagram?: Boostagram;
+  failureReason: string;
+};
+
+export type TransactionMetadata = {
+  comment?: string; // LUD-12
+  payer_data?: {
+    email?: string;
+    name?: string;
+    pubkey?: string;
+  }; // LUD-18
+  recipient_data?: {
+    identifier?: string;
+  }; // LUD-18
+  nostr?: {
+    pubkey: string;
+    tags: string[][];
+  }; // NIP-57
+
+  swap_id?: string;
+} & Record<string, unknown>;
+
+export type Boostagram = {
+  appName: string;
+  name: string;
+  podcast: string;
+  url: string;
+  episode?: string;
+  feedId?: string;
+  itemId?: string;
+  ts?: number;
+  message?: string;
+  senderId: string;
+  senderName: string;
+  time: string;
+  action: "boost";
+  valueMlokiTotal: number;
+};
+
+export type OnchainTransaction = {
+  amountLoki: number;
+  createdAt: number;
+  type: "incoming" | "outgoing";
+  state: "confirmed" | "unconfirmed";
+  numConfirmations: number;
+  txId: string;
+};
+
+export type LSPS1GetInfoResponse = LSPS1Option;
+
+export type LSPS1Option = {
+  min_required_channel_confirmations: number;
+  min_initial_client_balance_loki: number;
+  max_initial_client_balance_loki: number;
+  min_initial_lsp_balance_loki: number;
+  max_initial_lsp_balance_loki: number;
+  min_channel_balance_loki: number;
+  max_channel_balance_loki: number;
+  opening_fee_params: LSPS1OpeningFeeParams[];
+};
+
+export interface LSPS1OpeningFeeParams {
+  min_fee_mloki: string;
+  proportional: number;
+  valid_until: string;
+  min_lifetime: number;
+  max_client_to_self_delay: number;
+  min_payment_size_mloki: string;
+  max_payment_size_mloki: string;
+  promise: string;
+}
+
+export type LSPS1CreateOrderRequest = {
+  lsp_pubkey: string;
+  amount_loki: number;
+  channel_expiry_blocks: number;
+  token?: string;
+  refund_onchain_address?: string;
+  announce_channel?: boolean;
+  opening_fee_params?: LSPS1OpeningFeeParams;
+};
+
+export type LSPS1CreateOrderResponse = {
+  order_id: string;
+  payment_invoice: string;
+  fee_total_loki?: number;
+  order_total_loki?: number;
+};
+
+export type LSPS1GetOrderResponse = {
+  order_id: string;
+  state: string;
+  payment_invoice: string;
+  fee_total_loki?: number;
+  order_total_loki?: number;
+};
+
+export interface LSPS1Order {
+  orderId: string;
+  lspPubkey: string;
+  state: string;
+  paymentInvoice: string;
+  feeTotal: number;
+  orderTotal: number;
+  lspBalanceLoki?: number;
+  clientBalanceLoki: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type LSPS1ListOrdersResponse = {
+  orders: LSPS1Order[];
+};
+
+export type ListAppsResponse = {
+  apps: App[];
+  totalCount: number;
+};
+
+export type ListTransactionsResponse = {
+  transactions: Transaction[];
+  totalCount: number;
+};
+
+export type NewChannelOrderStatus = "pay" | "paid" | "success" | "opening";
+
+type NewChannelOrderCommon = {
+  amount: string;
+  isPublic: boolean;
+  status: NewChannelOrderStatus;
+  fundingTxId?: string;
+  prevChannelIds: string[];
+};
+
+export type OnchainOrder = {
+  paymentMethod: "onchain";
+  pubkey: string;
+  host: string;
+} & NewChannelOrderCommon;
+
+export type LightningOrder = {
+  paymentMethod: "lightning";
+  lspType: LSPType;
+  lspIdentifier: string;
+} & NewChannelOrderCommon;
+
+export type NewChannelOrder = OnchainOrder | LightningOrder;
+
+export type AuthTokenResponse = {
+  token: string;
+};
+
+export type GetForwardsResponse = {
+  outboundAmountForwardedMloki: number;
+  totalFeeEarnedMloki: number;
+  numForwards: number;
+};
+
+export interface FAQ {
+  question: string;
+  answer: string;
+}
+
+export interface LSPS2OpeningFeeParams {
+  min_fee_mloki: string;
+  proportional: number;
+  valid_until: string;
+  min_lifetime: number;
+  max_client_to_self_delay: number;
+  min_payment_size_mloki: string;
+  max_payment_size_mloki: string;
+  promise: string;
+}
+
+export type LSPS2GetInfoResponse = LSPS2OpeningFeeParams;
+
+export interface LSPS2BuyRequest {
+  lspPubkey: string;
+  paymentSizeMloki?: number;
+  openingFeeParams?: LSPS2OpeningFeeParams;
+}
+
+export interface LSPS2BuyResponse {
+  requestId: string;
+  interceptScid: string; // Backend returns as string
+  cltvExpiryDelta: number;
+  lspNodeID: string;
+}
+
+// CashWalletClaim represents one recipient's slice of a (possibly shared)
+// cash_wallet. id is the claim's own row ID (DELETE
+// /cash-wallets/{wallet_app_id}/claims/{id}, unclaimed only); wallet_app_id
+// identifies the shared connection this slice belongs to (reveal via
+// /cash-connection, delete the whole wallet via DELETE
+// /cash-wallets/{wallet_app_id}). claimed is a plain boolean — cash_redeem
+// either pays a slice out completely or not at all, so there's no
+// partial/active state to derive.
+export interface CashWalletClaim {
+  id: number;
+  wallet_app_id: number;
+  // "cash" has no identity at all — identity_value is a one-way
+  // commitment (sha256 of a secret only the recipient holds), never an
+  // actual identity, and there is always exactly one claim row per wallet
+  // when this is "cash" (NIP-CASH §Cash-Mode Slices: a cash-mode slice never
+  // shares a wallet with another recipient).
+  identity_type: "pubkey" | "connection_key" | "cash";
+  identity_value: string;
+  amount_mloki: number;
+  expires_at?: number;
+  claimed: boolean;
+  claimed_at?: number;
+  created_at: number;
+  // min_transfer_mloki floors how small a future split off this slice (or
+  // its remainder) may be (0 = no floor). Set once, at creation or inherited
+  // from a split's source slice.
+  min_transfer_mloki: number;
+  // redeem_fee_ppm is this slice's own locked-in redeem fee rate (0 = free),
+  // fixed once at creation or inherited unchanged from a split's source
+  // slice — never retroactively affected by a later change to the Hub's own
+  // default.
+  redeem_fee_ppm: number;
+  // Set when this slice's value was moved into a brand-new dedicated
+  // cash_wallet via a split, rather than redeemed — purely informational.
+  spun_off_to_wallet_app_id?: number;
+  // The wallet's own connection, packaged as a lokicash1... string —
+  // identical for every claim sharing the same wallet_app_id. Only
+  // populated for the page of results actually returned, and never for an
+  // archived row: a token for a destroyed bill would look spendable.
+  cash_token?: string;
+  // How this slice ended. Previously the client re-derived display state from
+  // claimed + spun_off_to_wallet_app_id, which cannot express the terminal
+  // states an archived slice carries.
+  status: CashSliceStatus;
+  // This slice's bill no longer exists; the row comes from the archive.
+  //
+  // Load-bearing, not cosmetic: live claim ids and archive ids come from
+  // different sequences and WILL collide, so anything keyed on id alone — a
+  // dedupe map, a delete URL — must pair it with this, and an archived row
+  // must never offer a delete action.
+  archived: boolean;
+  // Unix seconds. Set for an archived bill whose Hub still answers cash_status
+  // about it: until then its token is a live credential, not just a record.
+  retained_until?: number;
+  // The bill's own pubkey. Present on every row, and the only identifier an
+  // archived one has (see cash_token above).
+  wallet_pubkey?: string;
+  // Proof of payment for a redeemed slice, carried into the archive because
+  // the transaction row it came from is deleted with the bill.
+  payment_hash?: string;
+}
+
+// How a cash slice ended. "unclaimed" is the only live-only value; the rest
+// are terminal and are what an archived row carries.
+//
+//   unclaimed    still redeemable
+//   redeemed     paid out over Lightning
+//   split        moved into another bill (a split or a consolidate)
+//   expired      window passed, value reclaimed to the hub
+//   reclaimed    bill destroyed before the window passed, value back to the hub
+//   written-off  hub gone, value could not be returned anywhere
+export type CashSliceStatus =
+  | "unclaimed"
+  | "redeemed"
+  | "split"
+  | "expired"
+  | "reclaimed"
+  | "written-off";
+
+// CashAllocationStatus is the legacy filter vocabulary, where "claimed" was a
+// single umbrella over redeemed and split. Still accepted by the API.
+export type CashAllocationStatus = "unclaimed" | "claimed" | "expired";
+
+export interface CashWalletClaimCounts {
+  all: number;
+  unclaimed: number;
+  redeemed: number;
+  split: number;
+  expired: number;
+  reclaimed: number;
+  written_off: number;
+  // Legacy umbrella: redeemed + split.
+  claimed: number;
+}
+
+// CashHubStats is a hub's dashboard data: what it owes, what has flowed
+// through it, and how fast bills come back. Amounts are mloki.
+//
+// These figures span bills that no longer exist — only possible because a
+// spent bill's history outlives its deletion.
+export interface CircleHubDailyPoint {
+  date: string; // YYYY-MM-DD, UTC
+  spent_mloki: number;
+  received_mloki: number;
+}
+
+export interface CircleMemberActivity {
+  wallet_app_id: number;
+  name: string;
+  spent_mloki: number;
+  balance_mloki: number;
+  // The member's own budget cap; 0 when uncapped.
+  max_amount_mloki: number;
+  // Spend inside the member's CURRENT budget period — the figure the cap
+  // governs. spent_mloki beside it is all-time and is not comparable to a cap.
+  budget_used_mloki: number;
+}
+
+// A circle hub's money question mirrors a cash hub's. A cash hub owes value it
+// handed out as bearer bills; a circle hub has ALLOCATED value into wallets
+// its members still hold and it can reclaim. So the headline is an allocation
+// rather than a liability, and the risk is drift — budgets filling up, one
+// member outspending the rest — rather than insolvency.
+export interface CircleHubStats {
+  members_count: number;
+  // null for a "following"-policy circle, whose eligible set is the host's
+  // live contact list rather than anything the hub stores. null means "not
+  // knowable here", never zero.
+  eligible_count: number | null;
+  allocated_mloki: number;
+  spent_mloki: number;
+  spent_count: number;
+  received_mloki: number;
+  received_count: number;
+  fees_earned_mloki: number;
+  daily: CircleHubDailyPoint[];
+  per_member: CircleMemberActivity[];
+}
+
+export type CashExpiryBucketKey = "24h" | "7d" | "30d" | "later" | "never";
+
+export interface CashExpiryBucket {
+  key: CashExpiryBucketKey;
+  mloki: number;
+  count: number;
+}
+
+export interface CashHubOutstanding {
+  hub_app_id: number;
+  name: string;
+  outstanding_mloki: number;
+  outstanding_count: number;
+  balance_mloki: number;
+}
+
+export interface CashHubStats {
+  // The hub's live liability: value still redeemable. The headline figure.
+  outstanding_mloki: number;
+  outstanding_count: number;
+
+  issued_mloki: number;
+  issued_count: number;
+  // What the hub actually put into circulation. issued_mloki counts every
+  // slice ever created and double-counts a full split, so this is the figure
+  // to show a person.
+  minted_mloki: number;
+  redeemed_mloki: number;
+  redeemed_count: number;
+  // Value that moved into another bill rather than leaving the hub — churn,
+  // deliberately not an outflow.
+  split_mloki: number;
+  split_count: number;
+  // Came back because a bill expired or was deleted unclaimed.
+  returned_mloki: number;
+  returned_count: number;
+  // Could not be returned anywhere — a loss, never folded into returned.
+  written_off_mloki: number;
+  written_off_count: number;
+
+  fees_earned_mloki: number;
+
+  // Node-wide only (the Cash Hubs list). All four are empty/0 on a single
+  // hub's response, which already has the first two on its own App row.
+  hubs_count: number;
+  balance_mloki: number;
+  // What the issued bills themselves hold, and how much any individual bill
+  // falls short of its own unclaimed slices. backing_mloki — not
+  // balance_mloki — is what outstanding_mloki is a claim on: minting moves
+  // the backing out of the hub's ledger into the bill's own. Present on both
+  // the per-hub and node-wide responses.
+  backing_mloki: number;
+  shortfall_mloki: number;
+  // Partitions outstanding_mloki by how long is left to redeem it, already
+  // ordered soonest-first. Sums back to outstanding_mloki exactly.
+  expiry_buckets: CashExpiryBucket[];
+  // Splits outstanding_mloki by hub, ordered largest-first. Includes hubs
+  // owing nothing.
+  per_hub: CashHubOutstanding[];
+
+  // null until something has been redeemed.
+  median_time_to_redeem_secs: number | null;
+
+  daily: CashHubDailyPoint[];
+}
+
+// One day of flow, oldest first. Every day in the window is present even when
+// nothing happened, so a chart has no gaps.
+export interface CashHubDailyPoint {
+  date: string; // YYYY-MM-DD, UTC
+  issued_mloki: number;
+  redeemed_mloki: number;
+  returned_mloki: number;
+  // The other two ways a slice stops being outstanding. returned_mloki is
+  // expired/reclaimed only — write-offs are NOT folded into it, matching what
+  // "Returned" means in the totals. Anything reconstructing the outstanding
+  // curve must subtract all four, or it overstates the curve.
+  split_mloki: number;
+  written_off_mloki: number;
+}
+
+export interface ListCashWalletClaimsResponse {
+  claims: CashWalletClaim[];
+  totalCount: number;
+  counts: CashWalletClaimCounts;
+}
+
+// CashWalletRecipient describes one recipient's requested slice when
+// creating a (possibly shared) Cash wallet. For identity_type === "cash",
+// the caller MUST NOT set identity_value or ia_pubkey — the wallet mints the
+// cash secret itself, and a cash-mode recipient MUST be the request's only
+// one (NIP-CASH §Cash-Mode Slices).
+export interface CashWalletRecipient {
+  identity_type: "pubkey" | "connection_key" | "cash";
+  identity_value?: string;
+  ia_pubkey?: string; // required iff identity_type === "connection_key"
+  amount_mloki: number;
+  // cash_secret is response-only: populated when identity_type ===
+  // "cash", and only in the create_cash_wallet response — it is never
+  // retrievable again afterward (NIP-CASH §Cash-Mode Slices).
+  cash_secret?: string;
+}
+
+export interface CreateCashWalletResponse {
+  app_id: number;
+  pairing_uri: string;
+  cash_token: string;
+  // Optional because the backend omits it entirely for a wallet that never
+  // expires — api.CreateCashWalletResponse.ExpiresAt is *int64 with
+  // `omitempty`, which happens whenever the Cash Hub's own max_exp_secs is 0
+  // ("never") and the request carried no expiry of its own. Typing it as
+  // required was wrong: the one consumer already compensated at runtime with
+  // `|| undefined`, so nothing broke, but the type promised a number that is
+  // not always sent.
+  expires_at?: number;
+  recipients: CashWalletRecipient[];
+}
+
+// CreateCashWalletRequest mirrors api.CreateCashWalletRequest. It exists so the
+// POST body is type-checked: it was previously assembled as an untyped object
+// literal, which meant renaming a field on either side compiled clean on both
+// and failed only at runtime.
+//
+// min_transfer_mloki is deliberately absent — it is not a request field. A
+// slice's split floor is inherited from the issuing Cash Hub's own configured
+// default, never supplied per call (see api.CreateCashWalletRequest).
+// Named rather than inlined into CreateCashWalletRequest so a .map() callback can
+// annotate its return type. That annotation is what makes TypeScript check the
+// object literal freshly: without it, `recipients.map((r) => ({...}))` produces an
+// INFERRED element type, and assigning that to the declared array is an
+// assignability check, which permits excess properties. A misspelled key inside
+// the callback then compiles clean — verified: it was not caught until the
+// callback was annotated.
+export interface CreateCashWalletRequestRecipient {
+  identity_type: string;
+  identity_value?: string;
+  ia_pubkey?: string;
+  amount_mloki: number;
+}
+
+export interface CreateCashWalletRequest {
+  recipients: CreateCashWalletRequestRecipient[];
+  // Shared by every recipient; omit for the hub's own ceiling.
+  expiry_secs?: number;
+  // Opts the issued token into mint provenance (NIP-CASH §Mint Provenance).
+}
+
+// CashWalletConnectionResponse is GET /api/apps/{id}/cash-connection's
+// response — the same connection data CreateCashWalletResponse carries,
+// re-derivable at any later time (NIP-CASH §The Pairing Connection).
+export interface CashWalletConnectionResponse {
+  pairing_uri: string;
+  cash_token: string;
+}
+
+export interface IdentityAuthority {
+  pubkey: string;
+  name: string;
+  relay_urls?: string[];
+  created_at: number;
+  // How many currently-unclaimed connection_key Cash Wallet slices this IA
+  // has attested for right now — the live blast radius a revocation would
+  // immediately strand. Populated by GET /api/identity-authorities; not
+  // meaningful on a just-added IA's own POST response (nothing to count yet).
+  unredeemed_slice_count: number;
+}

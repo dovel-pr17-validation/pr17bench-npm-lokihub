@@ -1,0 +1,100 @@
+{
+  "title": "일반",
+  "description": "Lokihub 일반 설정.",
+  "sections": {
+    "appearance": "외관",
+    "unitsAndCurrency": "단위 및 통화",
+    "language": "언어"
+  },
+  "appearance": {
+    "theme": "테마",
+    "themeDescription": "비주얼 테마를 선택하세요",
+    "darkMode": "외관",
+    "darkModeDescription": "라이트, 다크 모드 또는 시스템 설정 따르기를 선택하세요",
+    "modes": {
+      "system": "시스템",
+      "light": "라이트",
+      "dark": "다크"
+    },
+    "themes": {
+      "default": "기본"
+    }
+  },
+  "units": {
+    "displayUnit": "표시 단위",
+    "displayUnitDescription": "금액 표시 방식을 선택하세요",
+    "fiatCurrency": "법정 통화",
+    "fiatCurrencyDescription": "선호하는 법정 기준 통화",
+    "auto": "자동"
+  },
+  "language": {
+    "label": "언어",
+    "description": "선호하는 인터페이스 언어를 선택하세요",
+    "updated": "언어가 업데이트되었습니다."
+  },
+  "toasts": {
+    "themeUpdated": "테마가 업데이트되었습니다.",
+    "appearanceUpdated": "외관이 업데이트되었습니다.",
+    "currencyUpdated": "통화가 {{currency}}로 설정되었습니다",
+    "formatUpdated": "Flokicoin 표시 형식이 업데이트되었습니다",
+    "currencyFetchFailed": "통화를 가져오지 못했습니다: {{error}}",
+    "updateFailed": "설정 업데이트에 실패했습니다"
+  },
+  "nav": {
+    "general": "일반",
+    "services": "서비스",
+    "autoUnlock": "자동 잠금 해제",
+    "unlockPassword": "잠금 해제 비밀번호",
+    "backup": "백업",
+    "migrate": "Lokihub 마이그레이션",
+    "developer": "개발자",
+    "debugTools": "디버그 도구",
+    "about": "정보"
+  },
+  "shutdown": {
+    "dialogTitle": "Lokihub를 끄시겠습니까?",
+    "dialogDesc": "이렇게 하면 Lokihub가 꺼지고 노드가 오프라인 상태가 됩니다. 잠금을 해제할 때까지 flokicoin을 보내거나 받을 수 없습니다.",
+    "cancel": "취소",
+    "confirm": "계속",
+    "toast": "노드가 꺼졌습니다.",
+    "failedToast": "노드 종료 실패"
+  },
+  "header": {
+    "title": "설정"
+  },
+  "changePassword": {
+    "title": "잠금 해제 비밀번호 변경",
+    "important": "중요!",
+    "currentPassword": "현재 비밀번호",
+    "newPassword": "새 비밀번호",
+    "confirmNew": "새 비밀번호 확인",
+    "save": "저장"
+  },
+  "backup": {
+    "title": "백업",
+    "important": "중요",
+    "passwordLabel": "비밀번호",
+    "active": "활성"
+  },
+  "autoUnlock": {
+    "title": "자동 잠금 해제",
+    "attention": "주의",
+    "passwordLabel": "잠금 해제 비밀번호"
+  },
+  "developer": {
+    "title": "개발자",
+    "tokenType": "토큰 유형",
+    "tokenExpiry": "토큰 만료 (일)",
+    "passwordLabel": "잠금 해제 비밀번호",
+    "createToken": "토큰 생성"
+  },
+  "debugTools": {
+    "title": "디버그 도구",
+    "probeInvoice": "인보이스 프로브",
+    "probeKeysend": "Keysend 프로브",
+    "networkGraph": "네트워크 그래프 가져오기",
+    "refundTo": "환불 대상",
+    "onchainAddress": "온체인 주소",
+    "cancel": "취소"
+  }
+}

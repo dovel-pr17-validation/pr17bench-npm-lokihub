@@ -1,0 +1,456 @@
+//go:build integration
+
+// delete_test.go treats hub/child deletion as a first-class subject under
+// test, rather than the pure fixture-teardown role it plays everywhere else
+// in this suite (see admin_client.go's deleteCircleChild/deleteCashWallet/
+// deleteApp and ephemeral_test.go's own t.Cleanup usage). It exercises real
+// scenarios around apps.DeleteApp's child-count guard and
+// service.ReclaimAndDeleteSubWallet's reclaim/settlement-deferral behavior
+// for both hub kinds.
+package integration
+
+import (
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/ohstr/nmilat/nipcw"
+	"github.com/stretchr/testify/require"
+
+	"github.com/flokiorg/lokihub/constants"
+)
+
+// findCircleChildAppID resolves requesterPubkey's circle_wallet child app id
+// under hubAppID via the admin API - listCircleChildren returns exactly
+// this pairing, but callers otherwise only get the wallet's own NWC pubkey
+// back from create_circle_wallet, not its admin app id.
+func findCircleChildAppID(t *testing.T, admin *adminClient, hubAppID uint, requesterPubkey string) uint {
+	t.Helper()
+	children, err := admin.listCircleChildren(hubAppID)
+	require.NoError(t, err)
+	for _, child := range children {
+		if child.RequesterPubkey == requesterPubkey {
+			return child.AppID
+		}
+	}
+	t.Fatalf("no circle child found for requester pubkey %s under hub app_id=%d", requesterPubkey, hubAppID)
+	return 0
+}
+
+// TestDeleteCircleHub_RefusedWhileChildrenExist proves apps.DeleteApp's own
+// child-count guard: a circle_hub with a live circle_wallet child attached
+// must refuse deletion outright (never orphan the child's ParentAppID, which
+// has no DB-level cascade), and must succeed once that child is gone.
+func TestDeleteCircleHub_RefusedWhileChildrenExist(t *testing.T) {
+	cfg := requireConfig(t)
+	privkey := newTestPrivkey(t)
+	hub, hubAppID, admin := createEphemeralCircleHub(t, cfg, "delete-guard-circle-hub", circlePolicyAllowlist, []string{privkey},
+		ephemeralCircleHubOpts{FundLoki: 10_000})
+	hubClient := mustConnect(t, hub.Connection)
+	pubkey := mustPubkey(t, privkey)
+	identityEvent := buildCircleWalletIdentityEvent(t, privkey, hubClient.WalletPubkey())
+
+	var created CreateCircleWalletResult
+	require.NoError(t, hubClient.Call(ctxT(t), constants.NIP47MethodCreateCircleWallet, CreateCircleWalletParams{
+		Pubkey:        pubkey,
+		MaxAmount:     happyPathAmountMloki,
+		Expiry:        happyPathExpirySecs,
+		BudgetRenewal: constants.BUDGET_RENEWAL_NEVER,
+		IdentityEvent: eventJSON(t, identityEvent),
+	}, &created))
+
+	err := admin.deleteApp(hubAppID)
+	require.Error(t, err, "a circle_hub with a live child must refuse deletion")
+	require.True(t, strings.Contains(err.Error(), "member wallet"), "expected apps.DeleteApp's own child-count guard message, got: %v", err)
+
+	childAppID := findCircleChildAppID(t, admin, hubAppID, pubkey)
+	require.NoError(t, admin.deleteCircleChild(hubAppID, childAppID))
+	require.NoError(t, admin.deleteApp(hubAppID), "once the only child is gone, the hub itself must now delete cleanly")
+}
+
+// TestDeleteCashHub_RefusedWhileChildrenExist is
+// TestDeleteCircleHub_RefusedWhileChildrenExist's cash_hub mirror.
+func TestDeleteCashHub_RefusedWhileChildrenExist(t *testing.T) {
+	cfg := requireConfig(t)
+	hub, hubAppID, admin := createEphemeralCashHub(t, cfg, "delete-guard-cash-hub", nil)
+	hubClient := mustConnect(t, hub.Connection)
+
+	beneficiaryPub := mustPubkey(t, newTestPrivkey(t))
+	var created MintCashResult
+	require.NoError(t, hubClient.Call(ctxT(t), constants.NIP47MethodMintCash, MintCashParams{
+		Recipients: onePubkeyRecipient(beneficiaryPub, happyPathAmountMloki),
+		Expiry:     happyPathExpirySecs,
+	}, &created))
+
+	err := admin.deleteApp(hubAppID)
+	require.Error(t, err, "a cash_hub with a live child must refuse deletion")
+	require.True(t, strings.Contains(err.Error(), "issued wallet"), "expected apps.DeleteApp's own child-count guard message, got: %v", err)
+
+	claims, err := admin.listCashWalletClaims(hubAppID)
+	require.NoError(t, err)
+	require.NotEmpty(t, claims)
+	require.NoError(t, admin.deleteCashWallet(hubAppID, claims[0].WalletAppID))
+	require.NoError(t, admin.deleteApp(hubAppID), "once the only child is gone, the hub itself must now delete cleanly")
+}
+
+// TestDeleteCircleChild_ReclaimsBalanceToHub proves
+// service.ReclaimAndDeleteSubWallet's reclaim half: deleting a funded child
+// must credit its exact remaining isolated balance back to the parent hub,
+// not write it off.
+func TestDeleteCircleChild_ReclaimsBalanceToHub(t *testing.T) {
+	cfg := requireConfig(t)
+	privkey := newTestPrivkey(t)
+	hub, hubAppID, admin := createEphemeralCircleHub(t, cfg, "delete-reclaim-circle-hub", circlePolicyAllowlist, []string{privkey},
+		ephemeralCircleHubOpts{FundLoki: 10_000})
+	hubClient := mustConnect(t, hub.Connection)
+	pubkey := mustPubkey(t, privkey)
+	identityEvent := buildCircleWalletIdentityEvent(t, privkey, hubClient.WalletPubkey())
+
+	var hubBalanceBefore GetBalanceResult
+	require.NoError(t, hubClient.Call(ctxT(t), "get_balance", struct{}{}, &hubBalanceBefore))
+
+	var created CreateCircleWalletResult
+	require.NoError(t, hubClient.Call(ctxT(t), constants.NIP47MethodCreateCircleWallet, CreateCircleWalletParams{
+		Pubkey:        pubkey,
+		MaxAmount:     happyPathAmountMloki,
+		Expiry:        happyPathExpirySecs,
+		BudgetRenewal: constants.BUDGET_RENEWAL_NEVER,
+		IdentityEvent: eventJSON(t, identityEvent),
+	}, &created))
+
+	circleDetails, err := DecryptCircleWalletDetails(privkey, hubClient.WalletPubkey(), created)
+	require.NoError(t, err)
+	pairingURI := CircleWalletURI(circleDetails, pubkey)
+	child := mustConnect(t, pairingURI)
+
+	const fundAmountMloki = 3000
+	fundCircleChild(t, cfg, child, fundAmountMloki, "integration delete-reclaim fund")
+
+	var childBalance GetBalanceResult
+	require.NoError(t, child.Call(ctxT(t), "get_balance", struct{}{}, &childBalance))
+	require.EqualValues(t, fundAmountMloki, childBalance.Balance)
+
+	childAppID := findCircleChildAppID(t, admin, hubAppID, pubkey)
+	require.NoError(t, admin.deleteCircleChild(hubAppID, childAppID))
+
+	var hubBalanceAfter GetBalanceResult
+	require.NoError(t, hubClient.Call(ctxT(t), "get_balance", struct{}{}, &hubBalanceAfter))
+	require.EqualValues(t, hubBalanceBefore.Balance+fundAmountMloki, hubBalanceAfter.Balance,
+		"deleting a funded child must reclaim its exact remaining balance back to the hub")
+}
+
+// TestDeleteCashWallet_UnclaimedReclaimsFullAmountToHub is
+// TestDeleteCircleChild_ReclaimsBalanceToHub's cash_hub mirror: a cash_wallet
+// child is pre-funded with its full declared amount at creation time (moved
+// out of the hub's own balance immediately, unlike a circle child which
+// starts at zero) - deleting it before anyone claims it must return that
+// entire amount to the hub, as if it had never been minted.
+func TestDeleteCashWallet_UnclaimedReclaimsFullAmountToHub(t *testing.T) {
+	cfg := requireConfig(t)
+	hub, hubAppID, admin := createEphemeralCashHub(t, cfg, "delete-reclaim-cash-hub", nil)
+	hubClient := mustConnect(t, hub.Connection)
+
+	var hubBalanceBefore GetBalanceResult
+	require.NoError(t, hubClient.Call(ctxT(t), "get_balance", struct{}{}, &hubBalanceBefore))
+
+	const amountMloki = 5000
+	beneficiaryPub := mustPubkey(t, newTestPrivkey(t))
+	var created MintCashResult
+	require.NoError(t, hubClient.Call(ctxT(t), constants.NIP47MethodMintCash, MintCashParams{
+		Recipients: onePubkeyRecipient(beneficiaryPub, amountMloki),
+		Expiry:     happyPathExpirySecs,
+	}, &created))
+
+	var hubBalanceMid GetBalanceResult
+	require.NoError(t, hubClient.Call(ctxT(t), "get_balance", struct{}{}, &hubBalanceMid))
+	require.EqualValues(t, hubBalanceBefore.Balance-amountMloki, hubBalanceMid.Balance,
+		"creating the child must have moved the amount out of the hub's own balance")
+
+	claims, err := admin.listCashWalletClaims(hubAppID)
+	require.NoError(t, err)
+	require.NoError(t, admin.deleteCashWallet(hubAppID, claims[0].WalletAppID))
+
+	var hubBalanceAfter GetBalanceResult
+	require.NoError(t, hubClient.Call(ctxT(t), "get_balance", struct{}{}, &hubBalanceAfter))
+	require.EqualValues(t, hubBalanceBefore.Balance, hubBalanceAfter.Balance,
+		"deleting an unclaimed cash child must reclaim its entire amount back to the hub, as if it never left")
+}
+
+// TestDeleteCircleChild_FreesIdentityForNewWallet proves the
+// one-active-wallet-per-identity cap (create_circle_wallet_controller.go's
+// CircleWalletMembership row) is actually released by a delete, not just
+// the app row removed: a second request for the same identity is rejected
+// while the first wallet is alive, but a third request for that same
+// identity succeeds once the first has been deleted.
+func TestDeleteCircleChild_FreesIdentityForNewWallet(t *testing.T) {
+	cfg := requireConfig(t)
+	privkey := newTestPrivkey(t)
+	hub, hubAppID, admin := createEphemeralCircleHub(t, cfg, "delete-free-identity-hub", circlePolicyAllowlist, []string{privkey},
+		ephemeralCircleHubOpts{FundLoki: 10_000})
+	hubClient := mustConnect(t, hub.Connection)
+	pubkey := mustPubkey(t, privkey)
+
+	ev1 := distinctCircleWalletIdentityEvent(t, privkey, hubClient.WalletPubkey(), "first")
+	var first CreateCircleWalletResult
+	require.NoError(t, hubClient.Call(ctxT(t), constants.NIP47MethodCreateCircleWallet, CreateCircleWalletParams{
+		Pubkey:        pubkey,
+		MaxAmount:     happyPathAmountMloki,
+		Expiry:        happyPathExpirySecs,
+		BudgetRenewal: constants.BUDGET_RENEWAL_NEVER,
+		IdentityEvent: eventJSON(t, ev1),
+	}, &first))
+
+	ev2 := distinctCircleWalletIdentityEvent(t, privkey, hubClient.WalletPubkey(), "second-before-delete")
+	var second CreateCircleWalletResult
+	err := hubClient.Call(ctxT(t), constants.NIP47MethodCreateCircleWallet, CreateCircleWalletParams{
+		Pubkey:        pubkey,
+		MaxAmount:     happyPathAmountMloki,
+		Expiry:        happyPathExpirySecs,
+		IdentityEvent: eventJSON(t, ev2),
+	}, &second)
+	requireNWCErrorCode(t, err, nipcw.ErrWalletExists)
+
+	childAppID := findCircleChildAppID(t, admin, hubAppID, pubkey)
+	require.NoError(t, admin.deleteCircleChild(hubAppID, childAppID))
+
+	ev3 := distinctCircleWalletIdentityEvent(t, privkey, hubClient.WalletPubkey(), "third-after-delete")
+	var third CreateCircleWalletResult
+	require.NoError(t, hubClient.Call(ctxT(t), constants.NIP47MethodCreateCircleWallet, CreateCircleWalletParams{
+		Pubkey:        pubkey,
+		MaxAmount:     happyPathAmountMloki,
+		Expiry:        happyPathExpirySecs,
+		BudgetRenewal: constants.BUDGET_RENEWAL_NEVER,
+		IdentityEvent: eventJSON(t, ev3),
+	}, &third), "the same identity must be free to mint again once its earlier wallet was deleted")
+	thirdDetails, err := DecryptCircleWalletDetails(privkey, hubClient.WalletPubkey(), third)
+	require.NoError(t, err)
+	require.NotEmpty(t, thirdDetails.WalletPubkey)
+}
+
+// TestDeleteCircleChild_DeferredWhilePaymentStillSettling proves
+// ReclaimAndDeleteSubWallet's HasPendingIncoming deferral end to end: a
+// child with any unpaid incoming invoice must refuse deletion (destroying
+// the app now would strand a payment that later settles into nothing to
+// credit), and must delete cleanly once that invoice is actually paid.
+//
+// Uses a one-shot admin.do call rather than the retrying deleteCircleChild
+// helper - this invoice is deliberately never going to settle on its own,
+// so retrying would just burn ~15s to reach the same error.
+func TestDeleteCircleChild_DeferredWhilePaymentStillSettling(t *testing.T) {
+	cfg := requireConfig(t)
+	privkey := newTestPrivkey(t)
+	hub, hubAppID, admin := createEphemeralCircleHub(t, cfg, "delete-settling-hub", circlePolicyAllowlist, []string{privkey},
+		ephemeralCircleHubOpts{FundLoki: 10_000})
+	hubClient := mustConnect(t, hub.Connection)
+	pubkey := mustPubkey(t, privkey)
+	identityEvent := buildCircleWalletIdentityEvent(t, privkey, hubClient.WalletPubkey())
+
+	var created CreateCircleWalletResult
+	require.NoError(t, hubClient.Call(ctxT(t), constants.NIP47MethodCreateCircleWallet, CreateCircleWalletParams{
+		Pubkey:        pubkey,
+		MaxAmount:     happyPathAmountMloki,
+		Expiry:        happyPathExpirySecs,
+		BudgetRenewal: constants.BUDGET_RENEWAL_NEVER,
+		IdentityEvent: eventJSON(t, identityEvent),
+	}, &created))
+
+	circleDetails, err := DecryptCircleWalletDetails(privkey, hubClient.WalletPubkey(), created)
+	require.NoError(t, err)
+	pairingURI := CircleWalletURI(circleDetails, pubkey)
+	child := mustConnect(t, pairingURI)
+
+	var invoice MakeInvoiceResult
+	require.NoError(t, child.Call(ctxT(t), "make_invoice", MakeInvoiceParams{
+		Amount:      1000,
+		Description: "integration delete-still-settling test",
+	}, &invoice))
+
+	childAppID := findCircleChildAppID(t, admin, hubAppID, pubkey)
+
+	deleteErr := admin.do(http.MethodDelete, deleteCircleChildPath(hubAppID, childAppID), nil)
+	require.Error(t, deleteErr, "a child with an unpaid incoming invoice must refuse deletion")
+	require.True(t, strings.Contains(deleteErr.Error(), "still settling"), "expected HasPendingIncoming's own deferral message, got: %v", deleteErr)
+
+	payInvoiceFromSimpleWallet(t, cfg, invoice.Invoice)
+
+	require.NoError(t, admin.deleteCircleChild(hubAppID, childAppID), "once the invoice is actually paid, deletion must succeed")
+}
+
+// TestDeleteCircleChild_AlreadyDeleted_Errors and
+// TestDeleteApp_Nonexistent_Errors both prove deletion isn't silently
+// idempotent - a second delete of the same child, or a delete of an id that
+// never existed, must surface an error rather than a quiet no-op success
+// (which would mask a caller's logic bug retrying a delete it thinks failed).
+func TestDeleteCircleChild_AlreadyDeleted_Errors(t *testing.T) {
+	cfg := requireConfig(t)
+	privkey := newTestPrivkey(t)
+	hub, hubAppID, admin := createEphemeralCircleHub(t, cfg, "delete-twice-hub", circlePolicyAllowlist, []string{privkey},
+		ephemeralCircleHubOpts{FundLoki: 10_000})
+	hubClient := mustConnect(t, hub.Connection)
+	pubkey := mustPubkey(t, privkey)
+	identityEvent := buildCircleWalletIdentityEvent(t, privkey, hubClient.WalletPubkey())
+
+	var created CreateCircleWalletResult
+	require.NoError(t, hubClient.Call(ctxT(t), constants.NIP47MethodCreateCircleWallet, CreateCircleWalletParams{
+		Pubkey:        pubkey,
+		MaxAmount:     happyPathAmountMloki,
+		Expiry:        happyPathExpirySecs,
+		BudgetRenewal: constants.BUDGET_RENEWAL_NEVER,
+		IdentityEvent: eventJSON(t, identityEvent),
+	}, &created))
+
+	childAppID := findCircleChildAppID(t, admin, hubAppID, pubkey)
+	require.NoError(t, admin.deleteCircleChild(hubAppID, childAppID))
+
+	err := admin.deleteCircleChild(hubAppID, childAppID)
+	require.Error(t, err, "deleting an already-deleted circle child must error, not silently succeed twice")
+}
+
+func TestDeleteApp_Nonexistent_Errors(t *testing.T) {
+	cfg := requireConfig(t)
+	admin, ok := newAdminClient(cfg)
+	if !ok {
+		t.Skip("skipping: admin_api not configured - see integration/README.md")
+	}
+	err := admin.deleteApp(999_999_999)
+	require.Error(t, err, "deleting a nonexistent app id must error, not silently succeed")
+}
+
+// findCashClaimByIdentity locates the claim row for identityValue among
+// claims - listCashWalletClaims returns every recipient across every live
+// wallet under the hub, not scoped to one wallet, so callers filter by
+// identity to find the one they minted.
+func findCashClaimByIdentity(t *testing.T, claims []adminCashWalletClaim, identityValue string) adminCashWalletClaim {
+	t.Helper()
+	for _, claim := range claims {
+		if claim.IdentityValue == identityValue {
+			return claim
+		}
+	}
+	t.Fatalf("no claim found for identity %s", identityValue)
+	return adminCashWalletClaim{}
+}
+
+// TestCashWalletClaim_ListingReflectsDeletionState is the exact regression
+// test for a real production incident: a cash_hub became permanently
+// undeletable ("still has 1 issued wallet(s)") while its own "issued
+// wallets" listing showed nothing at all. Root cause: DeleteCashClaim
+// removed a recipient's slice (sweeping its balance back to the hub
+// correctly) without ever checking whether that was the wallet's last
+// remaining claim - the now-empty wallet survived as an invisible orphan,
+// since ListCashWalletClaims is an inner join starting from the claims table
+// (a wallet with zero claims can never appear there, under any filter), yet
+// apps.DeleteApp's child-count guard kept counting it forever. This exercises
+// the fix end to end through the real admin HTTP API (not just the unit
+// test in api/cash_wallet_claims_test.go): the listing and the hub's own
+// deletability must stay consistent with each other at every step -
+// two-recipients-live, one-removed, and both-removed.
+func TestCashWalletClaim_ListingReflectsDeletionState(t *testing.T) {
+	cfg := requireConfig(t)
+	hub, hubAppID, admin := createEphemeralCashHub(t, cfg, "claim-listing-hub", nil)
+	hubClient := mustConnect(t, hub.Connection)
+
+	pub1 := mustPubkey(t, newTestPrivkey(t))
+	pub2 := mustPubkey(t, newTestPrivkey(t))
+	var created MintCashResult
+	require.NoError(t, hubClient.Call(ctxT(t), constants.NIP47MethodMintCash, MintCashParams{
+		Recipients: []CashWalletRecipientParam{
+			{IdentityType: "pubkey", IdentityValue: pub1, AmountMillis: happyPathAmountMloki},
+			{IdentityType: "pubkey", IdentityValue: pub2, AmountMillis: happyPathAmountMloki},
+		},
+		Expiry: happyPathExpirySecs,
+	}, &created))
+
+	t.Run("BothRecipientsLive_ListingShowsBoth_HubRefusesDeletion", func(t *testing.T) {
+		claims, err := admin.listCashWalletClaims(hubAppID)
+		require.NoError(t, err)
+		require.Len(t, claims, 2)
+
+		err = admin.deleteApp(hubAppID)
+		require.Error(t, err, "the hub must refuse deletion while its wallet is still live")
+	})
+
+	claim1 := func() adminCashWalletClaim {
+		claims, err := admin.listCashWalletClaims(hubAppID)
+		require.NoError(t, err)
+		return findCashClaimByIdentity(t, claims, pub1)
+	}()
+	walletAppID := claim1.WalletAppID
+
+	t.Run("OneRecipientRemoved_ListingShowsOnlyTheOther_HubStillRefuses", func(t *testing.T) {
+		require.NoError(t, admin.deleteCashWalletClaim(hubAppID, walletAppID, claim1.ID))
+
+		claims, err := admin.listCashWalletClaims(hubAppID)
+		require.NoError(t, err)
+		live := liveCashClaims(claims)
+		require.Len(t, live, 1, "the listing must still show the wallet - it still has a live recipient")
+		require.Equal(t, pub2, live[0].IdentityValue)
+
+		// The removed recipient is not simply gone: removing them archives the
+		// slice, so the operator keeps a record that they were once owed it.
+		archived := archivedCashClaims(claims)
+		require.Len(t, archived, 1, "a removed recipient must leave an archived slice behind")
+		require.Equal(t, pub1, archived[0].IdentityValue)
+
+		err = admin.deleteApp(hubAppID)
+		require.Error(t, err, "the hub must still refuse deletion - one recipient is still live")
+	})
+
+	t.Run("LastRecipientRemoved_ListingGoesToZero_HubBecomesImmediatelyDeletable", func(t *testing.T) {
+		claims, err := admin.listCashWalletClaims(hubAppID)
+		require.NoError(t, err)
+		claim2 := findCashClaimByIdentity(t, claims, pub2)
+
+		require.NoError(t, admin.deleteCashWalletClaim(hubAppID, walletAppID, claim2.ID))
+
+		claimsAfter, err := admin.listCashWalletClaims(hubAppID)
+		require.NoError(t, err)
+		require.Empty(t, liveCashClaims(claimsAfter),
+			"no live recipient may remain once every one has been removed")
+		require.Len(t, archivedCashClaims(claimsAfter), 2,
+			"both removed recipients stay in the archive - the wallet is gone, its history is not")
+
+		require.NoError(t, admin.deleteApp(hubAppID),
+			"once the wallet's last recipient is removed, the hub must be immediately deletable - proving the "+
+				"now-empty wallet was itself reclaimed and deleted, not left behind as an orphan the listing "+
+				"can never surface again")
+	})
+}
+
+// TestDeleteCashClaim_WrongHub_Rejected is the regression test for a
+// cross-hub deletion bug found in code review: DELETE
+// /api/apps/:id/cash-wallets/:walletId/claims/:claimId used to never validate
+// that walletId/claimId actually belonged to the hub named by :id - the
+// server-side handler parsed the URL's other IDs but silently ignored the
+// hub id entirely. A caller scoped to hub A's endpoint could delete (and
+// redirect the sweep-back of) a claim that actually belonged to a completely
+// unrelated hub B, simply by supplying hub B's walletId/claimId while hitting
+// hub A's URL.
+func TestDeleteCashClaim_WrongHub_Rejected(t *testing.T) {
+	cfg := requireConfig(t)
+	_, hubAppIDA, admin := createEphemeralCashHub(t, cfg, "wrong-hub-a", nil)
+	hubB, hubAppIDB, _ := createEphemeralCashHub(t, cfg, "wrong-hub-b", nil)
+
+	hubBClient := mustConnect(t, hubB.Connection)
+	pub := mustPubkey(t, newTestPrivkey(t))
+	var created MintCashResult
+	require.NoError(t, hubBClient.Call(ctxT(t), constants.NIP47MethodMintCash, MintCashParams{
+		Recipients: []CashWalletRecipientParam{
+			{IdentityType: "pubkey", IdentityValue: pub, AmountMillis: happyPathAmountMloki},
+		},
+		Expiry: happyPathExpirySecs,
+	}, &created))
+
+	claimsB, err := admin.listCashWalletClaims(hubAppIDB)
+	require.NoError(t, err)
+	require.Len(t, claimsB, 1)
+	claimB := claimsB[0]
+
+	// hubA's own ID in the URL, but walletAppID/claimID actually belong to hubB.
+	err = admin.deleteCashWalletClaim(hubAppIDA, claimB.WalletAppID, claimB.ID)
+	require.Error(t, err, "a claim belonging to a different hub must not be deletable through this hub's endpoint")
+
+	claimsBAfter, err := admin.listCashWalletClaims(hubAppIDB)
+	require.NoError(t, err)
+	require.Len(t, claimsBAfter, 1, "hubB's claim must be untouched by the rejected cross-hub request")
+}
